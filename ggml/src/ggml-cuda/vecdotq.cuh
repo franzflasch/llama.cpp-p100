@@ -474,10 +474,22 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
             sumi = ggml_cuda_dp4a(0xFCFCFCFC, u[VDR_Q3_K_Q8_1_MMVQ*i + j], sumi);
         }
 
-        sumf += d8[i] * (sumi * sc);
+        const int sc = (sc_low | sc_high) - 32;
+
+        // vil is a 2-bit value and vih is its bit-2 sign flag, so vil - vih is exactly the
+        // sign-extension of the 3-bit quantity vil|vih. Shifting that sign into bit 7
+        // yields a packed int8 worth 32*(vil - vih) and avoids __vsubss4 entirely; see the
+        // matching comment in vec_dot_q6_K_q8_1_impl_mmvq. The shifts fold into the
+        // extract shifts, so this is 2 instructions where __vsubss4 needed 6-9.
+        const int vil32 = ((vl >> (2*i)) << 5) & 0x60606060;
+        const int vih32 = ((vh >> i) << 7) & 0x80808080;
+
+        const int vi = vil32 | vih32; // vi = 32*(vil - vih)
+
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
-    return d3 * sumf;
+    return d3 * (1.0f/32.0f) * sumf; // undoes the scaling above; exact, it is a power of two
 }
 
 // contiguous v/x + u/y values
@@ -635,21 +647,24 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
     for (int i = 0; i < QR6_K; ++i) {
         const int sc = scales[4*i];
 
-        int sumi = 0;
-#pragma unroll
-        for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
-            const int vil = (vl[j] >> (4*i)) & 0x0F0F0F0F;
-            const int vih = ((vh[j] >> (4*i)) << 4) & 0x30303030;
+        // The quant b = vil|vih is a 6-bit unsigned value (bits 6/7 of each byte are 0)
+        // and we need the signed b - 32. Instead of __vsubss4 -- which no NVIDIA GPU has
+        // had in hardware since Kepler and which ptxas emulates in 6-9 instructions --
+        // note that b - 32 is exactly the sign-extension of b from bit 5. Flipping bit 5
+        // and shifting left by 2 moves that sign into bit 7, giving a packed int8 that
+        // dp4a can consume directly and that equals 4*(b - 32). Both shifts fold into the
+        // extract shifts that were needed anyway, and the bit-5 flip becomes an XOR that
+        // ptxas fuses into the adjacent LOP3, so the bias costs nothing at all.
+        // The factor of 4 is undone once, exactly, in the return statement.
+        const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
+        const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
 
-            // (vil | vih) - 32 for each byte, the - 32 is done by the second dp4a
-            sumi = ggml_cuda_dp4a(vil | vih,  u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi); // SIMD dot product
-            sumi = ggml_cuda_dp4a(0xE0E0E0E0, u[VDR_Q6_K_Q8_1_MMVQ*i + j], sumi);
-        }
+        const int vi = vil4 | vih4; // vi = 4*((vil | vih) - 32)
 
-        sumf += d8[i] * (sumi * sc);
+        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
-    return d*sumf;
+    return d*0.25f*sumf; // 0.25f undoes the scaling above; exact, it is a power of two
 }
 
 // contiguous v/x + u/y values
