@@ -158,15 +158,73 @@ static __global__ void rms_norm_f32(const T *     x,
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
+    x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+    dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+
+    if constexpr (do_multiply) {
+        const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+        const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+        const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+        mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+    }
+
+    if constexpr (do_add) {
+        const int add_row     = fastmodulo(row, add_nrows_packed);
+        const int add_channel = fastmodulo(channel, add_nchannels_packed);
+        const int add_sample  = fastmodulo(sample, add_nsamples_packed);
+        add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
+    }
+
+    // A row is normalised by a single block, so no other block covers this one's memory latency
+    // and the row is read twice: once to accumulate the sum of squares and again to scale it.
+    // When the row fits in a fixed number of registers per thread, hold it there instead: the
+    // loads all issue up front, and the second pass costs nothing.
+    constexpr int max_regs = 8;
+
     extern __shared__ float s_sum[];
 
     ggml_cuda_pdl_sync();
 
-    // grid.y and grid.z are clamped to the CUDA limit, iterate over the excess channels/samples
-    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
-        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
-            const T * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
-            T       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+    if (ncols <= block_size*max_regs) {
+        float xv[max_regs];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*block_size;
+            xv[u] = col < ncols ? x[col] : 0.0f;
+            tmp += xv[u] * xv[u];
+        }
+
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*block_size;
+            if (col < ncols) {
+                if constexpr (do_multiply && do_add) {
+                    dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)] + add[fastmodulo(col, add_ncols_packed)];
+                } else if constexpr (do_multiply) {
+                    dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)];
+                } else {
+                    dst[col] = scale * xv[u];
+                }
+            }
+        }
+        return;
+    }
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    // sum up partial sums
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
             [[maybe_unused]] const float * mulc = nullptr;
             if constexpr (do_multiply) {
