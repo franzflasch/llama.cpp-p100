@@ -1565,3 +1565,28 @@ Where the time goes now (per GPU, nvprof, at 442 t/s):
 
 GEMM-only ceiling is ~620 t/s. The GEMM runs at ~15.7 TFLOPS in-model against a
 19.05 peak (82% at sustained clocks), so it has little left.
+
+## 79 — MTP re-measured, and a better default (flag change)
+
+MTP had not been measured since the peer-copy fix. Re-swept with
+`p100-handoff/tools/mtp-bench.sh`:
+
+| n-max | p-min | t/s | accept |
+|---|---|---|---|
+| 2 | 0.05 | 48.92 | 89.2% |
+| 3 | 0.05 | 52.90 | 87.9% |
+| **4** | **0.2** | **54.04** | 78.2% |
+| 4 | 0.05 | 53.79 | 78.2% |
+| 5 | 0.05 | 53.02 | 71.9% |
+| 6 | 0.75 | 41.52 | 83.8% |
+
+48.8 (previous best, n-max 3) -> **54.04** with `--spec-draft-n-max 4
+--spec-draft-p-min 0.2`. +10.7%. Most of that is the peer-copy fix (72) --
+decode all-reduces are small but latency-dominated, which is exactly what that
+change addressed.
+
+Flat-to-falling past n-max 4: the accept rate decays faster than the extra
+speculated tokens pay for themselves. This is at the 53-55 t/s structural
+ceiling for the current kernel shape, so the 60 t/s goal needs a shape change
+(the draft head, or a batched-decode kernel that does not re-read weights per
+speculated token), not more tuning.
