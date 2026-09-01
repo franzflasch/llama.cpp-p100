@@ -2,12 +2,15 @@
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
 
-#include <cstdint>
+// Columns handled per block. Each block re-reads the whole k and q vector for the token, so with
+// the original 4 warps a 128-wide state was read by 32 separate blocks. Widening the block cuts
+// that redundancy (and the L1 traffic behind it) without changing any column's arithmetic.
+#ifndef P100_GDN_NWARPS
+#define P100_GDN_NWARPS 4
+#endif
 
-constexpr int gdn_cols_per_warp = 4;
-
-template <int S_v, bool KDA, bool keep_rs_t, int cols_per_warp = gdn_cols_per_warp>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+template <int S_v, bool KDA, bool keep_rs_t>
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * P100_GDN_NWARPS, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -191,16 +194,8 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    // four columns per warp (see the kernel); shrink the CTA when the wider CTA would leave
-    // SMs without a CTA, so small head counts keep the device filled
-    const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
-    const int cols_per_warp = gdn_cols_per_warp;
-    int num_warps = 4;
-    while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
-        num_warps /= 2;
-    }
-    // one CTA covers cols_per_warp*num_warps columns (see the kernel)
-    dim3      grid_dims(H, n_seqs, (S_v + cols_per_warp * num_warps - 1) / (cols_per_warp * num_warps));
+    const int num_warps = P100_GDN_NWARPS < S_v ? P100_GDN_NWARPS : (int) S_v;  // col must stay < S_v
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
