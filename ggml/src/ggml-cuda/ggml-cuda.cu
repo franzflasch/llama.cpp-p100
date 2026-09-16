@@ -2168,11 +2168,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ctx.device].cc;
-    const ggml_prec prec = ggml_prec_get_acc(dst);
+// The compute type ggml_cuda_mul_mat_cublas uses for dst = src0 x src1 on a device of compute capability cc.
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0, const ggml_tensor * dst, int cc) {
     ggml_type compute_type = src0->type;
-    if (ggml_is_quantized(compute_type) || compute_type == GGML_TYPE_F8_E4M3) {
+    if (ggml_is_quantized(compute_type)) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
         if (ggml_cuda_info().devices[ctx.device].prefer_fp32_acc) {
             compute_type = GGML_TYPE_BF16;
@@ -2210,6 +2209,11 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
         }
     }
+    return compute_type;
+}
+
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, dst, ggml_cuda_info().devices[ctx.device].cc);
 
     constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
     const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
@@ -3296,11 +3300,15 @@ static __global__ void k_probe_f16_exact(const float * __restrict__ x, const int
 // exactly-f16 values and can be shipped over PCIe at half the bytes with no loss at all.
 // Narrow batches go through mul_mat_vec_q instead, which produces genuine f32, hence the
 // ne[1] threshold -- it matches the condition under which the cuBLAS f16 path is taken.
+// The compute type is checked per exchange: the one-time probe below only sees the first
+// exchange, and a matmul whose weights are F32 or BF16, or that requests GGML_PREC_F32 (GLM4
+// does for these very projections), produces genuine f32 even when the first one did not.
 static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc) {
     return cc < GGML_CUDA_CC_VOLTA
         && src->op   == GGML_OP_MUL_MAT
         && src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src->ne[1] >= 512
+        && ggml_cuda_mul_mat_cublas_compute_type(src->src[0], src, cc) == GGML_TYPE_F16
         && ggml_is_contiguous(src) && ggml_is_contiguous(dst)
         && ggml_nelements(src) == ggml_nelements(dst)
         && ggml_nelements(src) % 2 == 0
