@@ -2421,14 +2421,22 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (node->flags & GGML_TENSOR_FLAG_COMPUTE) {
                 continue;
             }
-            if (ggml_nelements(node) > 0) {
-                ggml_tensor * node_zero = get_node_aux(node);
-                node_zero->op = GGML_OP_FILL;
-                node_zero->src[0] = node; // only used for the shape, the data is not read
-                ggml_set_op_params_f32(node_zero, 0, 0.0f);
-                node_zero->data = node->data;
-                node_zero->buffer = node->buffer;
-                node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            ggml_tensor * node_zero = get_node_aux(node);
+            // FILL, not SCALE by 0.0f: this slice was never computed, so its buffer holds whatever
+            // the allocator left there, and 0.0f * NaN is NaN -- which the reduction below then
+            // sums into every device.
+            node_zero->op = GGML_OP_FILL;
+            node_zero->src[0] = node;
+            ggml_set_op_params_f32(node_zero, 0, 0.0f);
+            static bool logged_zero_slice = false;
+            if (!logged_zero_slice) {
+                logged_zero_slice = true;
+                GGML_LOG_DEBUG("%s: device %zu has a zero-sized slice of %s; filling its output with 0\n",
+                        __func__, j, node->name);
+            }
+            node_zero->data = node->data;
+            node_zero->buffer = node->buffer;
+            node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
 
                 step_cgraphs[j] = get_cgraph_aux();
                 step_cgraphs[j]->nodes[0] = node_zero;
