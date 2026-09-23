@@ -3207,16 +3207,18 @@ private:
                         break;
                     }
 
-                    size_t nwrite_ckpt = 0;
-                    if (!save_slot_checkpoints(filepath, *slot, nwrite_ckpt)) {
-                        send_error(task, "Unable to save slot: incomplete context checkpoints", ERROR_TYPE_SERVER);
-                        break;
-                    }
-
+                    // The draft context (e.g. an MTP head) keeps its own KV cache over the same
+                    // positions. Without it a restored slot drafts against an empty cache, which
+                    // makes speculative decoding both faster and less accurate than real use.
                     size_t nwrite_dft = 0;
-                    if (!save_slot_draft(filepath, *slot, nwrite_dft)) {
-                        send_error(task, "Unable to save slot: incomplete draft state", ERROR_TYPE_SERVER);
-                        break;
+                    if (ctx_dft) {
+                        nwrite_dft = llama_state_seq_save_file(
+                            ctx_dft, (filepath + ".draft").c_str(), slot->id,
+                            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                        if (nwrite_dft == 0) {
+                            send_error(task, "Unable to save the draft context of the slot", ERROR_TYPE_SERVER);
+                            break;
+                        }
                     }
 
                     const int64_t t_end = ggml_time_us();
@@ -3228,7 +3230,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite + nwrite_ckpt + nwrite_dft;
+                    res->n_bytes  = nwrite + nwrite_dft;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -3267,6 +3269,21 @@ private:
                         packed.resize(n_packed);
 
                         server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+                        // restore the draft context's cache when the slot was saved with one
+                        if (ctx_dft) {
+                            const std::string path_dft = filepath + ".draft";
+                            if (std::ifstream(path_dft).good()) {
+                                llama_tokens packed_dft(packed.size());
+                                size_t n_packed_dft = 0;
+                                if (llama_state_seq_load_file(ctx_dft, path_dft.c_str(), slot->id,
+                                        packed_dft.data(), packed_dft.size(), &n_packed_dft) == 0) {
+                                    throw std::runtime_error("Unable to restore the draft context of the slot");
+                                }
+                            } else {
+                                SRV_WRN("slot file %s has no .draft companion; the draft context starts empty\n", filepath.c_str());
+                            }
+                        }
 
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
