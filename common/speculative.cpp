@@ -1828,12 +1828,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
-    // target h rows on the device (llama_set_embeddings_nextn_dev): the catch-up in process() reads row k - 1 of the last
-    // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
-    // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
-    bool    dev_rows    = false;
-    int32_t n_batch_tgt = 0;
-    std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
+    // LLAMA_SPEC_PROFILE=1: wall time of each phase, synchronized, printed every 64 draft calls
+    bool    prof = getenv("LLAMA_SPEC_PROFILE") != nullptr;
+    int64_t prof_catchup_us = 0, prof_step_us = 0, prof_n_catchup = 0, prof_n_step = 0, prof_n_draft = 0;
 
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
@@ -2052,7 +2049,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                const int64_t t0 = prof ? ggml_time_us() : 0;
+                const int32_t rc = llama_decode(ctx_dft, batch);
+                if (prof) {
+                    llama_synchronize(ctx_dft);
+                    prof_catchup_us += ggml_time_us() - t0;
+                    prof_n_catchup++;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -2172,7 +2175,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
-            int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            const int64_t t_step = prof ? ggml_time_us() : 0;
+            int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2253,11 +2257,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
-            if (batch.size() == 0) {
+            if (prof) {
+                prof_step_us += ggml_time_us() - t_step;
+                prof_n_step++;
+            }
+
+            if (batch.n_tokens == 0) {
                 break;
             }
 
             ++i;
+        }
+        if (prof && ++prof_n_draft % 64 == 0) {
+            SPC_INF("profile: catch-up %.2f ms x %.2f/draft, draft step %.2f ms x %.2f/draft\n",
+                    prof_catchup_us/1e3/std::max<int64_t>(1, prof_n_catchup), (double) prof_n_catchup/prof_n_draft,
+                    prof_step_us/1e3/std::max<int64_t>(1, prof_n_step), (double) prof_n_step/prof_n_draft);
         }
 
         if (chain_heads) {
