@@ -118,6 +118,11 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 
 LLAMA_API std::vector<ggml_tensor *> llama_memory_get_tensors(const llama_memory_t mem);
 
+// Fixed-width speculative verify: the next decodes' ubatches (2..8 tokens) have only their first
+// n tokens real, the rest padding the caller rolls back. Backends that support it then run the
+// costly ops on the real tokens only, with the results a graph of width n would give, while the
+// graph keeps one shape and is reused. 0 turns it off.
+LLAMA_API void llama_set_n_active_tokens(struct llama_context * ctx, int32_t n);
 // the backend buffers that a state write of this memory would touch - empty caches report none
 LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
 

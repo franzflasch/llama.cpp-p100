@@ -17,6 +17,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_set_n_active_tokens (fixed-width verify)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -175,7 +176,22 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
-    void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
+    // a padded fixed-width verify of one slot: its real tokens, and the batch size it applies to
+    int32_t n_active      = 0;
+    int32_t n_active_full = 0;
+
+    server_batch() {
+        batch.pos = nullptr; // sentinel: uninitialized batch
+    }
+
+    ~server_batch() {
+        if (batch.pos != nullptr) {
+            clear();
+            llama_batch_free(batch);
+        }
+    }
+
+    void init(int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
         view = common_batch(ctx);
@@ -212,6 +228,14 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        n_active          = 0;
+        n_active_full     = 0;
+        batch_rendered    = false;
+        has_embd          = false;
+        if (batch.token == nullptr) {
+            batch.token = tokens_ptr;
+            batch.embd  = nullptr;
+        }
     }
 
     int32_t size() const {
@@ -308,6 +332,9 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // fixed-width verify: the draft is padded to n_max and only its first spec_n_real tokens are
+    // real (-1: not padded)
+    int  spec_n_real = -1;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
@@ -434,6 +461,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_n_real = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -644,6 +672,14 @@ struct server_slot {
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
             GGML_ASSERT(spec_i_batch.empty());
+
+            if (spec_n_real >= 0 && batch.size() == 0) {
+                batch.n_active      = spec_n_real + 1;
+                batch.n_active_full = (int32_t) spec_draft.size() + 1;
+            } else {
+                batch.n_active      = 0;
+                batch.n_active_full = 0;
+            }
 
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
@@ -1101,6 +1137,7 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+    bool spec_pad = false; // verify at a fixed width, padding short drafts
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1511,6 +1548,13 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            // fixed-width verify (LLAMA_SPEC_PAD=0 turns it off): one slot only, since the real
+            // token count is declared per decode
+            spec_pad = params_base.n_parallel == 1 && [] {
+                const char * e = getenv("LLAMA_SPEC_PAD");
+                return !e || atoi(e) != 0;
+            }();
+            params_base.speculative.draft.pad_verify = spec_pad;
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -3902,7 +3946,19 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.stats.n_draft_tokens += draft.size();
+            // pad a short draft to n_max, so that the verify always has one width and its graph is
+            // reused; the backends compute only the real tokens (llama_set_n_active_tokens)
+            slot.spec_n_real = -1;
+            if (spec_pad) {
+                const int n_max = common_speculative_n_max(spec.get());
+                const int n_real = (int) draft.size();
+                if (n_real < n_max && n_max <= slot.get_n_draft_max()) {
+                    draft.resize(n_max, draft.empty() ? slot.sampled : draft.back());
+                    slot.spec_n_real = n_real;
+                }
+            }
+
+            slot.stats.n_draft_tokens += slot.spec_n_real >= 0 ? slot.spec_n_real : (int) draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -4658,8 +4714,15 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool padded = batch.n_active > 0 && batch_view.n_tokens == batch.n_active_full && off == 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (padded) {
+                llama_set_n_active_tokens(ctx_tgt, batch.n_active);
+            }
+            ret = llama_decode(ctx_tgt, batch_view);
+            if (padded) {
+                llama_set_n_active_tokens(ctx_tgt, 0);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4905,23 +4968,22 @@ private:
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-
-                // drafters that fill no distribution fall back here
-                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
-
                 std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
-                    // synthetic acceptance replaces verification entirely, so it comes first
-                    accepted = server_sample_and_accept_synth(
-                            slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
-                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
-                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
-                } else if (use_rejection) {
-                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                if (slot.spec_n_real >= 0 && !slot.spec_is_replay && synth_probs.empty()) {
+                    // padded verify: only the first spec_n_real drafts (and their outputs) are real
+                    const int nr = slot.spec_n_real;
+                    const llama_tokens         draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + nr);
+                    const std::vector<int32_t> idxs_real(slot.spec_i_batch.begin(), slot.spec_i_batch.begin() + nr + 1);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, idxs_real, draft_real);
                 } else {
-                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
+                    accepted = synth_probs.empty()
+                        ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                        : server_sample_and_accept_synth(
+                                slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                                synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 }
+                slot.spec_n_real = -1;
+                slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
 
