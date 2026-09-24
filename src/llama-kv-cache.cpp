@@ -1694,11 +1694,7 @@ struct args_set_input_attn_mask {
     int64_t n_stream;
     int64_t n_tps;
 
-    // cell of each mask column per stream, nullptr if the columns are the cells
-    const int32_t * rows;
-
-    // every token of a sequence reuses the mask row of the first one (dspark draft blocks)
-    bool block_uniform;
+    bool single_seq; // the cache holds one sequence, so every non-empty cell belongs to it
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1786,6 +1782,28 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+                }
+            }
+
+            // one sequence, plain causal mask: a cell is kept iff it is used and not in the future.
+            // Vectorizable, and it reads 4 bytes per cell instead of the 32-byte sequence set, which
+            // at 262144 cells takes the first row of a mask from ~1.5 ms to a fraction of that.
+            if constexpr (causal && !swa && !is_2d && !alibi) {
+                if (!prev && args.single_seq) {
+                    const llama_pos * cpos = cells.pos_data();
+                    T * row = data + idst;
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        const llama_pos c = cpos[j];
+                        row[j] = (c >= 0 && c <= p1) ? mask_keep : mask_drop;
+                    }
+                    // the cells the other tokens of this sequence may flip (see below)
+                    const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
+                    for (int64_t j = 0; j < n_kv; ++j) {
+                        if (cpos[j] >= thr && cpos[j] >= 0) {
+                            idxs.push_back((uint32_t) j);
+                        }
+                    }
+                    continue;
                 }
             }
 
@@ -1927,7 +1945,18 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         ggml_tensor * dst = attn_mask.raw;
         const int32_t * rows = attn_mask.rows && attn_mask.rows->buffer ? (const int32_t *) attn_mask.rows->data : nullptr;
 
-        const uint32_t n_tokens = ubatch->n_tokens;
+    const args_set_input_kq_mask args = {
+        /*.hparams          =*/ hparams,
+        /*.ubatch           =*/ ubatch,
+        /*.v_cells          =*/ v_cells,
+        /*.seq_to_stream    =*/ seq_to_stream,
+        /*.n_swa            =*/ n_swa,
+        /*.swa_type         =*/ swa_type,
+        /*.n_kv             =*/ n_kv,
+        /*.n_stream         =*/ n_stream,
+        /*.n_tps            =*/ n_tps,
+        /*.single_seq       =*/ n_seq_max == 1,
+    };
 
         const int64_t n_kv     = dst->ne[0];
         const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
