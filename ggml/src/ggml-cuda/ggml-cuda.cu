@@ -37,6 +37,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mmvq-f16.cuh"
+#include "ggml-cuda/gemm-fold.cuh"
 #include "ggml-cuda/cpy-batch.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
@@ -2215,31 +2216,15 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0,
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, dst, ggml_cuda_info().devices[ctx.device].cc);
+    ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc);
 
-    constexpr size_t max_src0_convert_size = 512ull * 1024 * 1024;
-    const size_t src0_f32_size = ggml_nelements(src0) * sizeof(float);
-
-    if (compute_type == GGML_TYPE_F32 &&
-            (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
-            src0_f32_size > max_src0_convert_size) {
-        const size_t f32_row_size = src0_f32_size / src0->ne[1];
-        const int64_t rows_per_chunk = std::max<int64_t>(1, (int64_t) (max_src0_convert_size / f32_row_size));
-
-        if (rows_per_chunk < src0->ne[1]) {
-            ggml_tensor src0_chunk = *src0;
-            ggml_tensor dst_chunk = *dst;
-
-            for (int64_t i01 = 0; i01 < src0->ne[1]; i01 += rows_per_chunk) {
-                src0_chunk.ne[1] = std::min(rows_per_chunk, src0->ne[1] - i01);
-                src0_chunk.data = (char *) src0->data + i01*src0->nb[1];
-
-                dst_chunk.ne[0] = src0_chunk.ne[1];
-                dst_chunk.data = (char *) dst->data + i01*dst->nb[0];
-
-                ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, &src0_chunk, src1, &dst_chunk);
-            }
+    // Pascal: fp16 products with fp32 accumulation instead of cuBLAS's whole-K fp16 accumulation
+    if (compute_type == GGML_TYPE_F16) {
+        if (ggml_cuda_gemm_fold_try(ctx, src0, src1, dst)) {
             return;
+        }
+        if (ggml_cuda_gemm_fold_wants_f32(ctx, src0, src1, dst)) {
+            compute_type = GGML_TYPE_F32;
         }
     }
 
