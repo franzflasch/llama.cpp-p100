@@ -1,5 +1,10 @@
 #include "llama-kv-cache.h"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#include <type_traits>
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1801,13 +1806,43 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                     const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
                     for (int64_t j0 = 0; j0 < n_kv; j0 += 64) {
                         const int64_t j1 = std::min<int64_t>(n_kv, j0 + 64);
-                        llama_pos bm = -1;
-                        for (int64_t j = j0; j < j1; ++j) {
-                            const llama_pos c = cpos[j];
-                            row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
-                            bm = std::max(bm, c);
+                        bool near = false; // this block may hold a cell with pos >= thr
+#if defined(__SSE2__)
+                        if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+                            if (j1 - j0 == 64) {
+                                // 8 cells per step: keep iff 0 <= pos (<= p1 when causal); f16 0 or -inf
+                                const __m128i lo  = _mm_set1_epi32(-1);
+                                const __m128i hi  = _mm_set1_epi32(causal ? p1 + 1 : INT32_MAX);
+                                const __m128i th  = _mm_set1_epi32(std::max<llama_pos>(thr, 0) - 1);
+                                const __m128i ninf = _mm_set1_epi16((short) 0xFC00);
+                                __m128i any = _mm_setzero_si128();
+                                for (int64_t j = j0; j < j1; j += 8) {
+                                    const __m128i c0 = _mm_loadu_si128((const __m128i *) (cpos + j));
+                                    const __m128i c1 = _mm_loadu_si128((const __m128i *) (cpos + j + 4));
+                                    const __m128i k0 = _mm_and_si128(_mm_cmpgt_epi32(c0, lo), _mm_cmplt_epi32(c0, hi));
+                                    const __m128i k1 = _mm_and_si128(_mm_cmpgt_epi32(c1, lo), _mm_cmplt_epi32(c1, hi));
+                                    const __m128i k  = _mm_packs_epi32(k0, k1); // 0xFFFF where kept
+                                    _mm_storeu_si128((__m128i *) (row + j), _mm_andnot_si128(k, ninf));
+                                    any = _mm_or_si128(any, _mm_or_si128(_mm_cmpgt_epi32(c0, th), _mm_cmpgt_epi32(c1, th)));
+                                }
+                                near = _mm_movemask_epi8(any) != 0;
+                                goto near_cells;
+                            }
                         }
-                        if (bm >= thr && bm >= 0) {
+#endif
+                        {
+                            llama_pos bm = -1;
+                            for (int64_t j = j0; j < j1; ++j) {
+                                const llama_pos c = cpos[j];
+                                row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
+                                bm = std::max(bm, c);
+                            }
+                            near = bm >= thr && bm >= 0;
+                        }
+#if defined(__SSE2__)
+near_cells:
+#endif
+                        if (near) {
                             for (int64_t j = j0; j < j1; ++j) {
                                 if (cpos[j] >= thr && cpos[j] >= 0) {
                                     idxs.push_back((uint32_t) j);
@@ -1957,10 +1992,8 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         cells.get_seq_cells(get_kv_rows_slices(*ubatch, n_slices, n_swa, swa_type), data, n_rows);
     }
 
-    // the mask is left unallocated when the graph only stores K/V without attending
-    if (attn_mask.raw && attn_mask.raw->buffer) {
-        ggml_tensor * dst = attn_mask.raw;
-        const int32_t * rows = attn_mask.rows && attn_mask.rows->buffer ? (const int32_t *) attn_mask.rows->data : nullptr;
+    static const bool tl_mask = getenv("LLAMA_TL_MASK") != nullptr; // TEMP timing
+    const int64_t t_start = tl_mask ? ggml_time_us() : 0;
 
     const args_set_input_kq_mask args = {
         /*.hparams          =*/ hparams,
@@ -2024,6 +2057,11 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
 
         //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
     }
+
+    if (tl_mask) { fprintf(stderr, "TL_MASK n_kv %lld n_tokens %u : %lld us\n", (long long) n_kv, n_tokens, (long long) (ggml_time_us() - t_start)); }
+    //const int64_t t_end = ggml_time_us();
+
+    //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
