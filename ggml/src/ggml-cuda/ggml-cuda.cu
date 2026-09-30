@@ -2622,169 +2622,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
-    if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
+// Mirrors ggml_cuda_mul_mat's routing: true iff it would reach ggml_cuda_mul_mat_cublas with an f16
+// compute type (where the fold GEMM is tried). Used to decide the SwiGLU -> fold prescale fusion.
+static bool ggml_cuda_mul_mat_is_cublas_f16(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                            const ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
         return false;
     }
-    const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
-    const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
-                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
-    const int outputs[] = { routed_idx + 2, shared_idx + 2 };
-    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 6, ops, outputs, 2)) {
-        return false;
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (!(bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32)) {
+        const int     warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+        const int64_t ne11      = src1->ne[1];
+        if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
+            return false;
+        }
+        if (src0->ne[1] == 1 && ne11 > MMVF_MAX_BATCH_SIZE && dst->ne[2] == 1 && dst->ne[3] == 1 && src0->type == GGML_TYPE_F32) {
+            return false; // (the transposed-vector case; conservatively without its remaining conditions)
+        }
+        if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) ||
+            ggml_cuda_should_use_mmvq(src0->type, cc, ne11) ||
+            ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+            return false;
+        }
     }
-
-    const ggml_tensor * routed = graph->nodes[routed_idx + 2];
-    const ggml_tensor * shared = graph->nodes[shared_idx + 2];
-    const ggml_tensor * gate = routed->src[0];
-    const ggml_tensor * up = routed->src[1];
-    const ggml_tensor * shared_gate = shared->src[0];
-    const ggml_tensor * shared_up = shared->src[1];
-    const auto is_pair = [&](const ggml_tensor * a, const ggml_tensor * b, int idx) {
-        return (a == graph->nodes[idx] && b == graph->nodes[idx + 1]) ||
-               (b == graph->nodes[idx] && a == graph->nodes[idx + 1]);
-    };
-    // only batch-size independent checks here: graph_optimize must produce the same graph topology for every ubatch
-    // size, otherwise ggml-alloc has to re-reserve (and the scheduler to synchronize) at runtime.
-    // the MMVQ batch size check is done in ggml_cuda_try_fuse
-    if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
-            !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
-            !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
-            !up->src[0]->buffer ||
-            !ggml_is_quantized(up->src[0]->type)) {
-        return false;
-    }
-    const ggml_tensor * input = up->src[1];
-    const ggml_tensor * weight = up->src[0];
-    const ggml_tensor * shared_weight = shared_up->src[0];
-    if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
-            input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
-            !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
-            weight->type != shared_weight->type || weight->ne[0] != shared_weight->ne[0] ||
-            weight->ne[1] != shared_weight->ne[1] || weight->nb[1] != shared_weight->nb[1] || weight->ne[3] != 1 ||
-            !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
-            !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
-        return false;
-    }
-    if (shared_weight->op != GGML_OP_NONE || shared_gate->src[0]->op != GGML_OP_NONE ||
-            ggml_get_glu_op(routed) != ggml_get_glu_op(shared) ||
-            ggml_get_op_params_f32(routed, 3) != ggml_get_op_params_f32(shared, 3)) {
-        return false;
-    }
-    return true;
-}
-
-// The weight scale that scale_node (MUL) applies to the output of mm_node (MUL_MAT), or nullptr.
-// Shared by ggml_cuda_try_fuse and graph_optimize so that both accept the same patterns.
-static const ggml_tensor * ggml_cuda_get_mul_mat_scale(const ggml_tensor * scale_node, const ggml_tensor * mm_node) {
-    const bool scale_lhs_mm = scale_node->src[0] == mm_node;
-    const bool scale_rhs_mm = scale_node->src[1] == mm_node;
-    if (!scale_lhs_mm && !scale_rhs_mm) {
-        return nullptr;
-    }
-
-    const ggml_tensor * scale = scale_lhs_mm ? scale_node->src[1] : scale_node->src[0];
-    if ((mm_node->src[0]->type != GGML_TYPE_NVFP4 && mm_node->src[0]->type != GGML_TYPE_F8_E4M3) || scale_node->type != GGML_TYPE_F32 ||
-            scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != 1 ||
-            !ggml_are_same_shape(scale_node, mm_node)) {
-        return nullptr;
-    }
-
-    return scale;
-}
-
-// The same for MUL_MAT_ID with one scale per expert: RESHAPE, REPEAT and GET_ROWS (by the ids) of the scales, then the MUL.
-static const ggml_tensor * ggml_cuda_get_mul_mat_id_scale(const ggml_tensor * reshape, const ggml_tensor * repeat, const ggml_tensor * getrows,
-        const ggml_tensor * scale_node, const ggml_tensor * mm_node) {
-    if (repeat->src[0] != reshape || getrows->src[0] != repeat || getrows->src[1] != mm_node->src[2]) {
-        return nullptr;
-    }
-    if (!((scale_node->src[0] == mm_node && scale_node->src[1] == getrows) ||
-            (scale_node->src[0] == getrows && scale_node->src[1] == mm_node))) {
-        return nullptr;
-    }
-
-    const ggml_tensor * scale = reshape->src[0];
-    if ((mm_node->src[0]->type != GGML_TYPE_NVFP4 && mm_node->src[0]->type != GGML_TYPE_F8_E4M3) || scale_node->type != GGML_TYPE_F32 ||
-            scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_nelements(scale) != mm_node->src[0]->ne[2] ||
-            !ggml_are_same_shape(scale_node, mm_node)) {
-        return nullptr;
-    }
-
-    return scale;
-}
-
-// Buffer- and batch-size independent, so graph_optimize produces the same graph topology for every ubatch size (see #29986).
-// up_scale/gate_scale: the MUL nodes that apply the NVFP4 weight scales (per tensor or per expert) between the MUL_MATs and the GLU.
-static bool ggml_cuda_mul_mat_q_fusion_matches(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int device,
-        const ggml_tensor * up_scale = nullptr, const ggml_tensor * gate_scale = nullptr) {
-    const ggml_tensor * x_up = up->src[0];
-    const ggml_tensor * y    = up->src[1];
-
-    if ((up->op != GGML_OP_MUL_MAT && up->op != GGML_OP_MUL_MAT_ID) || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    // The fused kernel is only compiled for weights whose rows fill whole tiles (no fallback).
-    if (ggml_cuda_mmq_needs_fallback(x_up->ne[1])) {
-        return false;
-    }
-
-    if (!ggml_cuda_should_fuse_mul_mat(up, gate, glu, nullptr, nullptr, up_scale, gate_scale)) {
-        return false;
-    }
-
-    // The fused kernel runs both MUL_MATs at one src1 precision, see ggml_cuda_mul_mat_q.
-    if (ggml_prec_get_src(up, 1) != ggml_prec_get_src(gate, 1)) {
-        return false;
-    }
-
-    // The fused write-back applies SWIGLU_OAI with the default alpha and limit of ggml_cuda_op_swiglu_oai_single.
-    if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI && (ggml_get_op_params_f32(glu, 2) != 1.702f || ggml_get_op_params_f32(glu, 3) != 7.0f)) {
-        return false;
-    }
-
-    // NVIDIA only: the fused write-back relies on the MMA accumulator layout.
-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
-}
-
-static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu,
-        const ggml_tensor * up_scale = nullptr, const ggml_tensor * gate_scale = nullptr) {
-    // A hinted matmul can be fused, but its unfused path may be faster (e.g. FWHT for GGML_HINT_SRC0_IS_HADAMARD).
-    if (ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
-        return false;
-    }
-
-    // The padding of a compute-buffer weight that is a view cannot be cleared, see ggml_cuda_mul_mat.
-    const auto bad_padding_clear = [](const ggml_tensor * x) {
-        return ggml_backend_buffer_get_usage(x->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-            ggml_nbytes(x) != ggml_backend_buffer_get_alloc_size(x->buffer, x) && x->view_src;
-    };
-    const int device = ggml_cuda_get_device();
-    if (!ggml_cuda_mul_mat_q_fusion_matches(up, gate, glu, device, up_scale, gate_scale) || bad_padding_clear(up->src[0]) || bad_padding_clear(gate->src[0])) {
-        return false;
-    }
-
-    // The batch size checks are done here, not in ggml_cuda_mul_mat_q_fusion_matches.
-    const ggml_tensor * x_up = up->src[0];
-    const ggml_tensor * y    = up->src[1];
-    const int           cc   = ggml_cuda_info().devices[device].cc;
-
-    // For MUL_MAT_ID: the MMVQ/MMQ choice of ggml_cuda_mul_mat_id, with the nominal tiles of all experts (the per-expert token counts are only known on the GPU).
-    const bool    is_id     = up->op == GGML_OP_MUL_MAT_ID;
-    const int64_t ncols     = is_id ? y->ne[2]    : y->ne[1];
-    const int64_t nchannels = is_id ? x_up->ne[2] : y->ne[2]*y->ne[3];
-    const bool    use_mmvq  = is_id ? ncols <= get_mmvq_mmid_max_batch(x_up->type, cc) : ggml_cuda_should_use_mmvq(x_up->type, cc, ncols);
-    // do not fuse the matmuls that few-row MMQ takes in ggml_cuda_mul_mat; for MUL_MAT_ID the fused MMQ keeps the expert gate and up
-    if (!is_id && ggml_cuda_should_use_mmq_few(x_up, y, nullptr, cc)) {
-        return false;
-    }
-    if (use_mmvq || !ggml_cuda_should_use_mmq(x_up->type, cc, ncols, /*n_experts =*/ is_id ? x_up->ne[2] : 0)) {
-        return false;
-    }
-
-    // The fused kernel needs one block per tile (no stream-k split), so only fuse if the tiling is efficient.
-    return ggml_cuda_mmq_fusion_is_efficient(x_up->type, ggml_prec_get_src(up, 1), x_up->ne[1], ncols, nchannels, device);
+    return ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, cc) == GGML_TYPE_F16;
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -6201,6 +6064,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         // With the use of CUDA graphs, the execution will be performed by the graph launch.
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
+            const ggml_tensor * fold_glu_mm = nullptr;   // MUL_MAT consuming a skipped SwiGLU (gemm-fold.cuh)
 
             if (stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
@@ -6360,8 +6224,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue; // the gated delta net reads the rows in place
                 }
 
-                int nodes_to_skip = known_no_fuse ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
-                if (fce != nullptr && !fce_valid && nodes_to_skip == 0) {
+                // the fold GEMM taking a skipped SwiGLU's inputs must run as a plain MUL_MAT
+                const bool glu_mm = fold_glu_mm == node;
+                GGML_ASSERT(glu_mm || !ggml_cuda_gemm_fold_glu_pending());
+                int nodes_to_skip = known_no_fuse || glu_mm ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                if (fce != nullptr && !fce_valid && nodes_to_skip == 0 && !glu_mm) {
                     fce->no_fuse[i] = 1;
                 }
 
@@ -6398,6 +6265,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // SwiGLU feeding a fold matmul: skip it; the fold's prescale computes silu(gate)*up (gemm-fold.cuh)
+                if (node->op == GGML_OP_GLU && !is_concurrent_event_active && i + 1 < cgraph->n_nodes &&
+                        node->src[1] != nullptr && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU &&
+                        ggml_get_op_params_i32(node, 1) == 0) {
+                    ggml_tensor * mm = cgraph->nodes[i + 1];
+                    if (mm->op == GGML_OP_MUL_MAT && (mm->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && mm->src[1] == node &&
+                            ggml_node_has_n_uses(cgraph, i, 1) &&
+                            ggml_cuda_mul_mat_is_cublas_f16(*cuda_ctx, mm->src[0], node, mm) &&
+                            ggml_cuda_gemm_fold_glu_ok(*cuda_ctx, node, mm)) {
+                        ggml_cuda_gemm_fold_set_glu(node);
+                        fold_glu_mm = mm;
+                        continue;
+                    }
+                }
                 cuda_ctx->xchg_want = i == cgraph->n_nodes - 1;
                 // two matmuls on the same activations may run as one fold launch (gemm-fold.cuh)
                 ggml_tensor * fold_partner = nullptr;
@@ -6412,6 +6293,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 cuda_ctx->xchg_want = false;
                 const bool fold_partner_done = ggml_cuda_gemm_fold_take_partner_done();
+                if (glu_mm) {
+                    GGML_ASSERT(!ggml_cuda_gemm_fold_glu_pending());
+                    fold_glu_mm = nullptr;
+                }
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
