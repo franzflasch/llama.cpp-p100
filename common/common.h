@@ -360,12 +360,10 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
+    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch); -ubd, --spec-draft-n-ubatch
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
-
-    int32_t n_ubatch = 0; // physical batch size for the draft context (0 - inherit the target's)
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -1326,7 +1324,8 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 // Allocator for checkpoint state buffers (hundreds of MiB each, written once by a device-to-host copy):
-// no value-initialization, and large blocks on 2 MiB-aligned memory advised for transparent huge pages.
+// no value-initialization, and large blocks on 2 MiB-aligned memory (advised for transparent huge pages
+// only with LLAMA_CKPT_MADVISE=1, see common_ckpt_alloc).
 // A fresh std::vector<uint8_t> of 150 MiB spent ~68 ms zero-filling and taking ~38k page faults, about
 // twice the copy itself, on every checkpoint.
 void * common_ckpt_alloc(size_t n);
@@ -1347,6 +1346,9 @@ struct common_ckpt_allocator {
 
 using common_ckpt_buffer = std::vector<uint8_t, common_ckpt_allocator<uint8_t>>;
 
+// upstream's name for sequence state data (llama_state_seq_get_data_ext); ours also skips the zero fill
+using common_state_data = common_ckpt_buffer;
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1356,8 +1358,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    common_ckpt_buffer data_tgt;
-    common_ckpt_buffer data_dft;
+    common_state_data data_tgt;
+    common_state_data data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
