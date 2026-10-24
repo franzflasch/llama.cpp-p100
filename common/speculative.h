@@ -73,11 +73,22 @@ struct common_speculative_draft_params {
     // the generated draft from the last _draft() call
     llama_tokens * result;
 
-    // when the draft was sampled rather than taken greedily: for each drafted token, the
+    // candidate distribution per drafted token; set it to make draft-simple, draft-mtp and draft-dflash2 sample
+    std::vector<std::vector<llama_token_data>> * result_q = nullptr;
+
+    // the target's temp and seed, read only when the drafter samples probabilistically
+    float    temp = 1.0f;
+    uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // (last: the positional initializers stop before it) when the draft was sampled rather than taken greedily: for each drafted token, the
     // distribution it was drawn from (candidates with normalized p). the target then verifies
     // with the speculative-sampling rule (common_sampler_sample_and_accept_n_dist). empty for
     // greedy drafts.
     std::vector<std::vector<llama_token_data>> dists = {};
+
+    // the target sampler's temperature for this sequence's request (< 0: unknown). LLAMA_SPEC_STOP_ISO applies only
+    // when it lies in LLAMA_SPEC_STOP_ISO_TEMP (or is unknown)
+    float target_temp = -1.0f;
 };
 
 // whether any configured draft type reads common_speculative_draft_params::prompt when drafting (the
