@@ -314,7 +314,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen3next::graph::build_qkvz
 
     if (model.layers[il].wqkv) {
         // optimized path
-        ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input);
+        ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
         ggml_build_forward_expand(gf, qkv_mixed);
         qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
         cb(qkv_mixed, "linear_attn_qkv_mixed", il);
@@ -528,11 +528,12 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // read the state right before the delta net (backends can fuse the read into it)
-    ggml_build_forward_expand(gf, q_conv);
-    ggml_build_forward_expand(gf, k_conv);
+    // gate and beta first, next to each other (backends fuse both mat-vecs and their epilogues), then the
+    // q/k norms and the state read right before the delta net (backends can fuse those into it)
     ggml_build_forward_expand(gf, gate);
     ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);

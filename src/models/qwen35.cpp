@@ -471,11 +471,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // read the state right before the delta net (backends can fuse the read into it)
-    ggml_build_forward_expand(gf, q_conv);
-    ggml_build_forward_expand(gf, k_conv);
+    // gate and beta first, next to each other (backends fuse both mat-vecs and their epilogues), then the
+    // q/k norms and the state read right before the delta net (backends can fuse those into it)
     ggml_build_forward_expand(gf, gate);
     ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -640,11 +641,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     if (kv_only && n_outputs == 0) {
         ggml_tensor * k_st = Kcur;
         ggml_tensor * v_st = Vcur;
-        if (inp_attn->self_k_rot) {
-            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot);
+        if (inp_attn->self_k_rot[il]) {
+            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot[il]);
         }
-        if (inp_attn->self_v_rot) {
-            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot);
+        if (inp_attn->self_v_rot[il]) {
+            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot[il]);
         }
         ggml_build_forward_expand(gf, v_st);
         ggml_build_forward_expand(gf, k_st);

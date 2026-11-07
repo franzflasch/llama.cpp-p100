@@ -5648,6 +5648,7 @@ struct test_gdn_decode_fusion : public test_case {
     const int64_t n_seqs;
     const int     row;
     const int     head;
+    const ggml_type mm_type;
 
     ggml_tensor * conv_cpy  = nullptr;
     ggml_tensor * state_cpy = nullptr;
@@ -5664,13 +5665,16 @@ struct test_gdn_decode_fusion : public test_case {
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, conv_cpy, state_cpy }; }
 
+    // quantized alpha/b mat-vecs: CPU and CUDA quantize the activations differently
+    double max_nmse_err() override { return mm_type == GGML_TYPE_COUNT || mm_type == GGML_TYPE_F32 ? 1e-7 : 5e-4; }
+
     std::string vars() override {
-        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head);
+        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head) + (mm_type == GGML_TYPE_COUNT ? std::string() : ",mm=" + std::string(ggml_type_name(mm_type)));
     }
 
     test_gdn_decode_fusion(int64_t H_k = 4, int64_t H_v = 12, int64_t S = 128, int64_t n_t = 1, int64_t n_seqs = 1,
-            int row = 1, int head = 1)
-        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head) {}
+            int row = 1, int head = 1, ggml_type mm_type = GGML_TYPE_COUNT)
+        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head), mm_type(mm_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t nr = 2*H_k*S + H_v*S; // conv channels
@@ -5681,8 +5685,21 @@ struct test_gdn_decode_fusion : public test_case {
         ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*nr, n_cells);
         ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_cells);
         ggml_tensor * ids        = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-        ggml_tensor * alpha      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
-        ggml_tensor * b          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+        ggml_tensor * alpha;
+        ggml_tensor * b;
+        if (mm_type != GGML_TYPE_COUNT) {
+            // as in the models: alpha and b are mat-vecs of the layer input
+            const int64_t n_embd = 256;
+            ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t*n_seqs);
+            ggml_tensor * w_a = ggml_new_tensor_2d(ctx, mm_type, n_embd, H_v);
+            ggml_tensor * w_b = ggml_new_tensor_2d(ctx, mm_type, n_embd, H_v);
+            ggml_set_name(cur, "cur");
+            b     = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_b, cur), 1, H_v, n_t, n_seqs);
+            alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_a, cur), H_v, n_t, n_seqs);
+        } else {
+            alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
+            b     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+        }
         ggml_tensor * dt         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
         ggml_tensor * A          = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
         ggml_tensor * z          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_t, n_seqs);
@@ -5727,10 +5744,10 @@ struct test_gdn_decode_fusion : public test_case {
         g = ggml_reshape_4d(ctx, g, 1, H_v, n_t, n_seqs);
         ggml_tensor * beta = ggml_sigmoid(ctx, b);
         if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, g); // the models build gate and beta first
+            ggml_build_forward_expand(gf, beta);
             ggml_build_forward_expand(gf, q);
             ggml_build_forward_expand(gf, k);
-            ggml_build_forward_expand(gf, g);
-            ggml_build_forward_expand(gf, beta);
         }
 
         // state read right before the delta net, new state stored back
@@ -13914,14 +13931,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat(t, GGML_TYPE_F32, 300, 4, 3072, {1, 1}, {1, 1}));
         for (int64_t m_batch : {2, 5, 10}) {
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(t, GGML_GLU_OP_SWIGLU, m_batch, 3072, 5376,
+            test_cases.emplace_back(new test_mul_mat_fusion(t, GGML_GLU_OP_SWIGLU, m_batch, 3072, 5376,
                 false, 1, 1, false, false, true, false, {1, 1}));
         }
     }
     // the fp16 q6_K gate+up+SWIGLU verify kernel (mmvq-f16.cu): >= 3072 rows, K a multiple of 512
     for (int64_t m_batch : { 2, 3, 4, 5, 6, 10, 13, 16 }) {
         for (int64_t n_rows : { 3072, 8704 }) {
-            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m_batch, n_rows, 5120,
+            test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_Q6_K, GGML_GLU_OP_SWIGLU, m_batch, n_rows, 5120,
                 false, 1, 1, false, false, true, false, {1, 1}));
         }
     }
@@ -14116,6 +14133,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, n_t));
     }
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1));
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1, 1, 1, 1, t));
+        test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 4, 1, 1, 1, t));
+    }
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 1, 1, /*row=*/0, /*head=*/1));
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 3, 1, /*row=*/2, /*head=*/0));
     test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, 1, /*n_seqs=*/2));
@@ -14486,6 +14507,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 17, 24, 25, 32, 33}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 4096, n, 14336, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 14336, n, 4096, {1, 1}, {1, 1}));
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {
@@ -14539,18 +14565,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // Same non-causal vision-encoder shape for the other head size padded in-kernel by the CUDA MMA kernels
     test_cases.emplace_back(new test_flash_attn_ext(40, 40, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-
-    // Sparse flash attention (n_kv_max hint) decode across KV depths.
-    // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
-    for (int64_t kv : {4096, 16384, 32768}) {
-        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
-        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
-    }
 
     // Long-context prefill attention, exactly as one GPU sees it for qwen3.5-27B under
     // -sm tensor -ctk q4_0 -ctv q4_0 -ub 2048: 2 KV heads, GQA 6 (12 Q heads), D 256.
@@ -14608,6 +14622,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
     for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
+    // Sparse flash attention (n_kv_max hint) decode across KV depths.
+    // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.
+    for (int64_t kv : {4096, 16384, 32768}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+        test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
