@@ -1639,7 +1639,7 @@ static __global__ void k_add_f16_into_f32(float * __restrict__ own, const half *
     }
 }
 
-static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc);
+static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc, bool prefer_fp32_acc);
 
 // Large (prefill) two-GPU exchange whose source matmul ran in token chunks (xchg, common.cuh): each
 // chunk is narrowed to f16 and sent as soon as its event fires, on the copy stream, while the compute
@@ -1672,7 +1672,7 @@ static bool ggml_cuda_allreduce_chunked(ggml_backend_cuda_context * ctx[2], stru
         const int cc = ggml_cuda_info().devices[ctx[j]->device].cc;
         if (xc.data != tensors[j]->data || xc.n < 2 || ctx[j]->peer_f16_ok != 1 ||
                 xc.n != ctx[1 - j]->xchg.n || xc.rows*xc.col[xc.n] != ne ||
-                !ggml_cuda_peer_copy_compressible(tensors[j], tensors[j], cc)) {
+                !ggml_cuda_peer_copy_compressible(tensors[j], tensors[j], cc, ggml_cuda_info().devices[ctx[j]->device].prefer_fp32_acc)) {
             return false;
         }
         for (int c = 0; c <= xc.n; ++c) {
@@ -2411,12 +2411,12 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 }
 
 // The compute type ggml_cuda_mul_mat_cublas uses for dst = src0 x src1 on a device of compute capability cc.
-static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc, bool prefer_fp32_acc) {
     const ggml_prec prec = ggml_prec_get_acc(dst);
     ggml_type compute_type = src0->type;
     if (ggml_is_quantized(compute_type) || compute_type == GGML_TYPE_F8_E4M3) {
         compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
-        if (ggml_cuda_info().devices[ctx.device].prefer_fp32_acc) {
+        if (prefer_fp32_acc) {
             compute_type = GGML_TYPE_BF16;
         }
     } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
@@ -2456,7 +2456,7 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0,
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
-    ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc);
+    ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, ggml_cuda_info().devices[ctx.device].cc, ggml_cuda_info().devices[ctx.device].prefer_fp32_acc);
 
     // Pascal: fp16 products with fp32 accumulation instead of cuBLAS's whole-K fp16 accumulation
     if (compute_type == GGML_TYPE_F16) {
@@ -2706,7 +2706,7 @@ static bool ggml_cuda_mul_mat_is_cublas_f16(ggml_backend_cuda_context & ctx, con
             return false;
         }
     }
-    return ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, cc) == GGML_TYPE_F16;
+    return ggml_cuda_mul_mat_cublas_compute_type(src0, src1, dst, cc, ggml_cuda_info().devices[ctx.device].prefer_fp32_acc) == GGML_TYPE_F16;
 }
 
 static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
@@ -3653,12 +3653,12 @@ static __global__ void k_probe_f16_exact(const float * __restrict__ x, const int
 // The compute type is checked per exchange: the one-time probe below only sees the first
 // exchange, and a matmul whose weights are F32 or BF16, or that requests GGML_PREC_F32 (GLM4
 // does for these very projections), produces genuine f32 even when the first one did not.
-static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc) {
+static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc, bool prefer_fp32_acc) {
     return cc < GGML_CUDA_CC_VOLTA
         && src->op   == GGML_OP_MUL_MAT
         && src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
         && src->ne[1] >= 512
-        && ggml_cuda_mul_mat_cublas_compute_type(src->src[0], src->src[1], src, cc) == GGML_TYPE_F16
+        && ggml_cuda_mul_mat_cublas_compute_type(src->src[0], src->src[1], src, cc, prefer_fp32_acc) == GGML_TYPE_F16
         && ggml_is_contiguous(src) && ggml_is_contiguous(dst)
         && ggml_nelements(src) == ggml_nelements(dst)
         && ggml_nelements(src) % 2 == 0
@@ -3732,7 +3732,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             }
 
             const int  cc_src  = ggml_cuda_info().devices[cuda_ctx_src->device].cc;
-            const bool eligible = ggml_cuda_peer_copy_compressible(src, dst, cc_src);
+            const bool eligible = ggml_cuda_peer_copy_compressible(src, dst, cc_src, ggml_cuda_info().devices[cuda_ctx_src->device].prefer_fp32_acc);
 
             // One-time probe, on the first eligible exchange. The probe copy itself still goes
             // uncompressed, so a model whose partials are not f16-exact never sees a lossy copy.
