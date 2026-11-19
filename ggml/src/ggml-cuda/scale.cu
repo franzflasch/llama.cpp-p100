@@ -24,7 +24,9 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
     const size_t i_src = d0.y + size_t(d1.y)*s01 + size_t(d2.y)*s02 + size_t(d2.x)*s03;
     const size_t i_dst = d0.y + size_t(d1.y)*s1  + size_t(d2.y)*s2  + size_t(d2.x)*s3;
 
-    dst[i_dst] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i_src]) + bias);
+    // scale == 0 means "zero this state" (llama-graph.cpp build_rs); do not let 0 * non-finite x
+    // stay non-finite, or a state that was supposed to be cleared keeps poisoning every reuse of it
+    dst[i_dst] = ggml_cuda_cast<T>(scale == 0.0f ? bias : scale * ggml_cuda_cast<float>(x[i_src]) + bias);
 }
 
 template <typename T>

@@ -2,6 +2,12 @@
 
 #include "common.cuh"
 
+// PROBE SWITCHES (sed 0->1); both break results, valid only on fixed-work benchmarks
+#define P100_NOY     0
+#define P100_MEMONLY 0
+#define P100_NOUNPACK 0
+
+
 #include <cstdint>
 
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
@@ -94,13 +100,45 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+#define GGML_CUDA_VECDOT_PASCAL 1
+#endif
+
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
     // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    return __byte_perm(s, 0, 0); // sm_60 has no 32 bit multiply
+#else
     return s * 0x01010101;
+#endif
+}
+
+// negate the grid bytes whose sign bit is set in sb (sign byte broadcast over the uint), selectors 0x08040201 / 0x80402010
+static __device__ __forceinline__ int sign_flip_lo(const int grid, const uint32_t sb) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    // PRMT replicates the msb of each byte; grid bytes are never 0 so the +1 of the negate cannot carry
+    uint32_t m;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m) : "r"((sb & 0x08040201) + 0x787C7E7F));
+    return (grid ^ m) + (m & 0x01010101);
+#else
+    const int signs = __vcmpne4(sb & 0x08040201, 0);
+    return __vsub4(grid ^ signs, signs);
+#endif
+}
+
+static __device__ __forceinline__ int sign_flip_hi(const int grid, const uint32_t sb) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    uint32_t m;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m) : "r"((sb & 0x80402010) + 0x70707070));
+    return (grid ^ m) + (m & 0x01010101);
+#else
+    const int signs = __vcmpne4(sb & 0x80402010, 0);
+    return __vsub4(grid ^ signs, signs);
+#endif
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
@@ -621,7 +659,13 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 2
+// P100 (sm_60): raised from 1 to 2. See vdr2_analysis.md for the derivation. This does NOT
+// widen the ql/qh global loads (block_q6_K's 210-byte stride keeps their alignment at 2 bytes
+// for ~half of all row-blocks, so a uniform, branch-free path must stay on get_int_b2 for both
+// values regardless of vdr). The win is eliminating the *redundant* re-fetch of bq6_K->d, the
+// two `scales` bytes, and the two q8_1 `.ds` scales, all four of which are IDENTICAL between
+// iqs and iqs+1 but were previously re-read from scratch by two separate warp lanes.
+#define VDR_Q6_K_Q8_1_MMVQ 4
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -1076,33 +1120,109 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
 
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
-    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    constexpr int vdr = VDR_Q6_K_Q8_1_MMVQ;
 
-    int vl[VDR_Q6_K_Q8_1_MMVQ];
-    int vh[VDR_Q6_K_Q8_1_MMVQ];
-#pragma unroll
-    for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
-        vl[j] = get_int_b2(bq6_K->ql, iqs + j);
-        vh[j] = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4) + j) >> vh_shift;
-    }
+    // mmvq.cu drives kqs = vdr * (tid % (qi/vdr)), so iqs is a multiple of vdr. bq8_offset,
+    // scale_offset and vh_shift are floor-divisions whose moduli (QI6_K/4 == 8, QI6_K/8 == 4)
+    // are multiples of vdr, so all vdr consecutive indices share them, while the ql index, the
+    // qh index and the q8_1 lane index are each consecutive across the group.
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
 
     const int8_t * scales = bq6_K->scales + scale_offset;
 
-    int    u[VDR_Q6_K_Q8_1_MMVQ*QR6_K];
-    float d8[QR6_K];
+    // Keep each i's dot product in an integer accumulator across the whole vdr group before
+    // touching floats. scales[4*i] and the q8_1 scale are constant over the group, so the
+    // per-lane integer multiply by the scale -- three XMADs on Pascal, which has no IMAD -- and
+    // the int->float conversion collapse from once per (l, i) pair to once per i. dp4a already
+    // takes an accumulator, so chaining the group costs nothing.
+    //
+    // Peak |acc| is vdr*4*128*128 = 262144, comfortably inside float's exactly-representable
+    // integer range, so folding the group before the conversion loses nothing; it also rounds
+    // twice per i instead of four times per i, so it is slightly more accurate than before.
+    int acc[QR6_K] = { 0 };
 
 #pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
+    for (int l = 0; l < vdr; ++l) {
+        const int vl = get_int_b2(bq6_K->ql, iqs + l);
+        const int vh = get_int_b2(bq6_K->qh, qh_idx + l) >> vh_shift;
+
 #pragma unroll
-        for (int j = 0; j < VDR_Q6_K_Q8_1_MMVQ; ++j) {
-            u[VDR_Q6_K_Q8_1_MMVQ*i + j] = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1 + j);
+        for (int i = 0; i < QR6_K; ++i) {
+            // 6-bit quant biased by -32, pre-scaled by 4 so the sign lands in bit 7; the factor
+            // of 4 is undone once in the return statement.
+#if P100_NOUNPACK
+            // PROBE: keep both loads and the dp4a, drop the shift/mask unpack that every column
+            // currently redoes, to price how much of the kernel that redundancy is worth.
+            const int vil4 = vl;
+            const int vih4 = vh;
+#else
+            const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
+            const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
+#endif
+
+#if P100_NOY
+            const int u = 0x01010101;
+#else
+            const int u = get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1);
+#endif
+
+#if P100_MEMONLY
+            acc[i] += (vil4 | vih4) ^ u;
+#else
+            acc[i] = ggml_cuda_dp4a(vil4 | vih4, u, acc[i]);
+#endif
         }
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+#if P100_NOY
+        sumf += (1.0f * (float) scales[4*i]) * (float) acc[i];
+#else
+        sumf += (__low2float(bq8_1[bq8_offset + 2*i].ds) * (float) scales[4*i]) * (float) acc[i];
+#endif
+    }
+
+    const float d = bq6_K->d; // via an initialisation: half * float is ambiguous as an expression
+    return d * 0.25f * sumf;  // 0.25f undoes the pre-scaling above; exact, a power of two
+}
+
+#ifdef GGML_CUDA_VECDOT_PASCAL
+// sm_60 gathers the small grids faster from shared memory than through L1/tex. The 4 and 8 KB grids lose on occupancy, they stay in global memory
+#define IQ2XXS_GRID iq2xxs_grid_sh
+#define IQ3XXS_GRID iq3xxs_grid_sh
+#define IQ3S_GRID   iq3s_grid_sh
+__shared__ uint2    iq2xxs_grid_sh[256];
+__shared__ uint32_t iq3xxs_grid_sh[256];
+__shared__ uint32_t iq3s_grid_sh[512];
+#else
+#define IQ2XXS_GRID ((const uint2 *) iq2xxs_grid)
+#define IQ3XXS_GRID iq3xxs_grid
+#define IQ3S_GRID   iq3s_grid
+#endif
+
+// Copy the grid of this type to shared memory. Every thread of the block must call it before any early exit.
+template <ggml_type type>
+static __device__ __forceinline__ void mmvq_stage_grid(const int tid, const int nthreads) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    if constexpr (type == GGML_TYPE_IQ2_XXS) {
+        for (int i = tid; i < 256; i += nthreads) { iq2xxs_grid_sh[i] = ((const uint2 *) iq2xxs_grid)[i]; }
+        __syncthreads();
+    }
+    if constexpr (type == GGML_TYPE_IQ3_XXS) {
+        for (int i = tid; i < 256; i += nthreads) { iq3xxs_grid_sh[i] = iq3xxs_grid[i]; }
+        __syncthreads();
+    }
+    if constexpr (type == GGML_TYPE_IQ3_S) {
+        for (int i = tid; i < 512; i += nthreads) { iq3s_grid_sh[i] = iq3s_grid[i]; }
+        __syncthreads();
+    }
+#endif
+    GGML_UNUSED_VARS(tid, nthreads);
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
@@ -1120,16 +1240,14 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
-        const uint2 grid_pos = ((const uint2*)iq2xxs_grid)[aux8[k0/2]];
+        const uint2 grid_pos = IQ2XXS_GRID[aux8[k0/2]];
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid0 = sign_flip_lo(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
         sumi = ggml_cuda_dp4a(grid0, u0, sumi);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid1 = sign_flip_hi(grid_pos.y, signs);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
         sumi = ggml_cuda_dp4a(grid1, u1, sumi);
     }
@@ -1160,12 +1278,10 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
         const uint2 grid_pos = ((const uint2*)iq2xs_grid)[q2[l0/2] & 0x1FF];
         const uint32_t signs = unpack_ksigns(q2[l0/2] >> 9);
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = sign_flip_lo(grid_pos.x, signs);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = sign_flip_hi(grid_pos.y, signs);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
@@ -1195,7 +1311,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     const int qh = bq2->qh[iqs/2];
 
     const int       signs_packed_32 = get_int_b2(bq2->qs, QK_K/32 + iqs/2);
-    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+    [[maybe_unused]] const uint8_t * signs_packed_8 = (const uint8_t *) &signs_packed_32;
 
     const int ls0 = bq2->scales[iqs/2] & 0x0F;
     const int ls1 = bq2->scales[iqs/2] >> 4;
@@ -1204,6 +1320,12 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
     int sumi1 = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+        const uint2 grid_pos = ((const uint2 *) iq2s_grid)[qs[l0/2] | ((qh << (8-l0)) & 0x300)];
+        const uint32_t sb = __byte_perm(signs_packed_32, 0, (l0/2)*0x1111);
+        const int grid_l = sign_flip_lo(grid_pos.x, sb);
+        const int grid_h = sign_flip_hi(grid_pos.y, sb);
+#else
         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
 
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
@@ -1211,6 +1333,7 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
 
         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+#endif
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
@@ -1244,16 +1367,14 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
-        const int2 grid_pos = make_int2(iq3xxs_grid[q3[l0 + 0]], iq3xxs_grid[q3[l0 + 1]]);
+        const int2 grid_pos = make_int2(IQ3XXS_GRID[q3[l0 + 0]], IQ3XXS_GRID[q3[l0 + 1]]);
         const uint32_t signs = unpack_ksigns(aux32 >> (7*l0/2));
 
-        const int signs0 = __vcmpne4(signs & 0x08040201, 0);
-        const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+        const int grid_l = sign_flip_lo(grid_pos.x, signs);
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
 
-        const int signs1 = __vcmpne4(signs & 0x80402010, 0);
-        const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+        const int grid_h = sign_flip_hi(grid_pos.y, signs);
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
@@ -1282,20 +1403,26 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
     const int qh = bq3->qh[iqs/2];
 
     const int       signs_packed_32 = get_int_b2(bq3->signs, iqs/2);
-    const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
+    [[maybe_unused]] const uint8_t * signs_packed_8 = (const uint8_t *) &signs_packed_32;
 
     int sumi = 0;
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(
-            iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
-            iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+            IQ3S_GRID[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+            IQ3S_GRID[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
 
+#ifdef GGML_CUDA_VECDOT_PASCAL
+        const uint32_t sb = __byte_perm(signs_packed_32, 0, (l0/2)*0x1111);
+        const int grid_l = sign_flip_lo(grid_pos.x, sb);
+        const int grid_h = sign_flip_hi(grid_pos.y, sb);
+#else
         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
 
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
 
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
