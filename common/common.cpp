@@ -15,6 +15,9 @@
 #include "unicode.h"
 
 #include <algorithm>
+#ifdef _MSC_VER
+#include <malloc.h> // _aligned_malloc/_aligned_free: MSVC has no C11 aligned_alloc
+#endif
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -26,11 +29,13 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -2439,6 +2444,8 @@ void common_prompt_checkpoint::clear() {
     data_dft.clear();
     data_spec.clear();
 }
+
+#include "common-p100.inc"
 
 void common_prompt_checkpoint::update_pos(
         int64_t n_tokens,
