@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -454,6 +455,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
     }
+    // LoRA tensors "<base>.lora_a" [n_in, r] and "<base>.lora_b" [r, n_out] follow the base weight's split:
+    // output-split base (axis 1) -> B split the same way, A mirrored; input-split base (axis 0) -> A split the
+    // same way (its rank-r product is a partial sum, reduced like the base's), B mirrored
+    {
+        const bool is_a = tensor_name.size() > 7 && tensor_name.compare(tensor_name.size() - 7, 7, ".lora_a") == 0;
+        const bool is_b = tensor_name.size() > 7 && tensor_name.compare(tensor_name.size() - 7, 7, ".lora_b") == 0;
+        if (is_a || is_b) {
+            const ggml_tensor * base = ud->model->get_tensor(tensor_name.substr(0, tensor_name.size() - 7).c_str());
+            GGML_ASSERT(base != nullptr);
+            const ggml_backend_meta_split_state base_ss = llama_meta_device_get_split_state(base, userdata);
+            if ((is_b && base_ss.axis == GGML_BACKEND_SPLIT_AXIS_1) || (is_a && base_ss.axis == GGML_BACKEND_SPLIT_AXIS_0)) {
+                return base_ss;
+            }
+            GGML_ASSERT(base_ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || base_ss.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                        base_ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            ggml_backend_meta_split_state ss;
+            memset(&ss, 0, sizeof(ss));
+            ss.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            ss.nr[0]      = 1;
+            ss.n_segments = 1;
+            return ss;
+        }
+    }
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -508,6 +532,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
+    static const std::regex pattern_output_draft ("output_draft\\.weight");
 
     struct tensor_config {
         ggml_backend_meta_split_axis axis;
@@ -706,6 +731,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+        }
+        if (std::regex_match(tensor_name, pattern_output_draft)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -2155,6 +2183,66 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     if (per_layer_tok_embd_s) {
         ggml_backend_tensor_get(per_layer_tok_embd_s, &per_layer_tok_embd_scale, 0, sizeof(per_layer_tok_embd_scale));
+    }
+
+    // Give the MTP draft head its own copy of the first draft_vocab rows of the
+    // output matrix, split over the devices like output itself. The draft then scores only those
+    // tokens (the others get -inf logits), which cuts its vocab projection by n_vocab/draft_vocab. Token ids
+    // follow BPE merge order, so the low ids are the common tokens (in 24k tokens of this model's
+    // generated text, ids < 81920 cover 98.2% and < 98304 99.95%; the rest are special tokens). Verification still uses the full output, so
+    // what the target emits keeps its distribution; only the draft proposals change.
+    // 81920 rows in q4_0: ~112 MiB per GPU of 2 (OPTLOG 226).
+    const int64_t draft_vocab = 81920;
+    if (output && hparams.n_layer_nextn > 0 && output->buffer && output->ne[1] > draft_vocab &&
+            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE)) {
+        const int64_t nd = draft_vocab;
+        const auto * w = ml.get_weight(ggml_get_name(output));
+        if (w != nullptr) {
+            // q4_0 copy: less VRAM and bandwidth, it only changes the draft's proposals
+            const ggml_type dtype = GGML_TYPE_Q4_0;
+            const int64_t n_embd_o = output->ne[0];
+            ggml_init_params ip = { ggml_tensor_overhead() * 2, nullptr, /*no_alloc =*/ true };
+            ggml_context * ctx = ggml_init(ip);
+            ggml_tensor * t = ggml_new_tensor_2d(ctx, dtype, n_embd_o, nd);
+            ggml_set_name(t, "output_draft.weight");
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(output->buffer));
+            GGML_ASSERT(buf != nullptr);
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            std::vector<uint8_t> src(ggml_row_size(output->type, n_embd_o)*nd);
+            ml.files.at(w->idx)->seek(w->offs, SEEK_SET);
+            ml.files.at(w->idx)->read_raw(src.data(), src.size());
+            std::vector<uint8_t> tmp;
+            if (dtype == output->type) {
+                tmp.swap(src);
+            } else {
+                tmp.resize(ggml_nbytes(t));
+                const auto * tt = ggml_get_type_traits(output->type);
+                GGML_ASSERT(tt->to_float != nullptr);
+                const int nth = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+                std::vector<std::thread> th;
+                const int64_t per = (nd + nth - 1)/nth;
+                for (int k = 0; k < nth; ++k) {
+                    th.emplace_back([&, k] {
+                        const int64_t r0 = k*per, r1 = std::min(nd, r0 + per);
+                        std::vector<float> f(n_embd_o);
+                        for (int64_t r = r0; r < r1; ++r) {
+                            tt->to_float(src.data() + r*ggml_row_size(output->type, n_embd_o), f.data(), n_embd_o);
+                            ggml_quantize_chunk(dtype, f.data(), tmp.data() + r*ggml_row_size(dtype, n_embd_o), 0, 1, n_embd_o, nullptr);
+                        }
+                    });
+                }
+                for (auto & x : th) {
+                    x.join();
+                }
+            }
+            ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
+            std::vector<ggml_backend_buffer_ptr> bufs;
+            bufs.emplace_back(buf);
+            pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx), std::move(bufs));
+            output_draft = t;
+            LLAMA_LOG_INFO("%s: MTP draft head: first %lld of %lld vocab rows (%.1f MiB)\n", __func__,
+                (long long) nd, (long long) output->ne[1], ggml_nbytes(t)/1024.0/1024.0);
+        }
     }
 
     load_tensors_hadamard();

@@ -248,6 +248,13 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // Compact causal mask (llama-graph build_attn_inp_kq_mask): with one sequence and no SWA/ALiBi, when
+    // every query row of the ubatch keeps exactly the first L_t cells and L_t = L_0 + t, the mask is
+    // passed to flash attention as I32 [n_tokens] of L_t instead of f16 [n_kv, n_tokens] (1 GiB at
+    // 262144 cells and a 2048-token ubatch). Same keep/drop pattern, checked cell by cell.
+    bool kq_mask_compact_static() const;
+    bool kq_mask_prefix(const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn, int32_t * L) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // pools of kpool consecutive tokens of a sequence, in the order of their positions, for a pooled indexer (hy_v4_flash)
@@ -462,6 +469,10 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_attn_mask (const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // true when this ubatch's mask can be compact (see llama_kv_cache::kq_mask_prefix); the reserve
+    // context (init_full) answers for the common case so the compute buffer is sized for it
+    bool kq_mask_compact(const llama_ubatch & ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_kpool(ggml_tensor * pool_idxs, ggml_tensor * pool_pos, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
             const llama_ubatch * ubatch, uint32_t kpool) const;
@@ -503,6 +514,7 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 
+    bool reserve = false; // built by init_full() for graph reservation
     // see llama_kv_cache::get_n_kv_rows
     uint32_t n_kv_rows = 0;
 };

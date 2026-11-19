@@ -1,5 +1,10 @@
 #include "llama-kv-cache.h"
 
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
+#include <type_traits>
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1692,6 +1697,8 @@ struct args_set_input_attn_mask {
 
     // every token of a sequence reuses the mask row of the first one (dspark draft blocks)
     bool block_uniform;
+
+    bool single_seq; // the cache holds one sequence, so every non-empty cell belongs to it
 };
 
 template<typename T, bool causal, bool swa, bool is_2d, bool alibi>
@@ -1779,6 +1786,74 @@ static void set_input_attn_mask_impl(const args_set_input_attn_mask & args, T * 
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+                }
+            }
+
+            // one sequence, no SWA or ALiBi: a cell is kept iff it is used and, for a causal mask, not
+            // in the future. Vectorizable, and it reads 4 bytes per cell instead of the 32-byte
+            // sequence set, which at 262144 cells takes the first row of a mask from ~1.5 ms to a
+            // fraction of that. With M-RoPE only the cells at the token's own position can differ
+            // from the 1-D rule; they are rechecked with the 2-D test below.
+            if constexpr (!swa && !alibi) {
+                if (!prev && args.single_seq && rows == nullptr) { // columns are the cells
+                    const llama_pos * cpos = cells.pos_data();
+                    T * row = data + idst;
+                    // one pass: the mask row, and a flag per 64 cells for "may hold a cell the other
+                    // tokens of this sequence could flip" (pos >= thr, see below), so the second
+                    // pass only visits those few blocks instead of rereading every position
+                    const llama_pos thr = seq_pos_min[seq_id] - (int32_t) (n_swa + 32);
+                    for (int64_t j0 = 0; j0 < n_kv; j0 += 64) {
+                        const int64_t j1 = std::min<int64_t>(n_kv, j0 + 64);
+                        bool near = false; // this block may hold a cell with pos >= thr
+#if defined(__SSE2__)
+                        if constexpr (std::is_same_v<T, ggml_fp16_t>) {
+                            if (j1 - j0 == 64) {
+                                // 8 cells per step: keep iff 0 <= pos (<= p1 when causal); f16 0 or -inf
+                                const __m128i lo  = _mm_set1_epi32(-1);
+                                const __m128i hi  = _mm_set1_epi32(causal ? p1 + 1 : INT32_MAX);
+                                const __m128i th  = _mm_set1_epi32(std::max<llama_pos>(thr, 0) - 1);
+                                const __m128i ninf = _mm_set1_epi16((short) 0xFC00);
+                                __m128i any = _mm_setzero_si128();
+                                for (int64_t j = j0; j < j1; j += 8) {
+                                    const __m128i c0 = _mm_loadu_si128((const __m128i *) (cpos + j));
+                                    const __m128i c1 = _mm_loadu_si128((const __m128i *) (cpos + j + 4));
+                                    const __m128i k0 = _mm_and_si128(_mm_cmpgt_epi32(c0, lo), _mm_cmplt_epi32(c0, hi));
+                                    const __m128i k1 = _mm_and_si128(_mm_cmpgt_epi32(c1, lo), _mm_cmplt_epi32(c1, hi));
+                                    const __m128i k  = _mm_packs_epi32(k0, k1); // 0xFFFF where kept
+                                    _mm_storeu_si128((__m128i *) (row + j), _mm_andnot_si128(k, ninf));
+                                    any = _mm_or_si128(any, _mm_or_si128(_mm_cmpgt_epi32(c0, th), _mm_cmpgt_epi32(c1, th)));
+                                }
+                                near = _mm_movemask_epi8(any) != 0;
+                                goto near_cells;
+                            }
+                        }
+#endif
+                        {
+                            llama_pos bm = -1;
+                            for (int64_t j = j0; j < j1; ++j) {
+                                const llama_pos c = cpos[j];
+                                row[j] = (c >= 0 && (!causal || c <= p1)) ? mask_keep : mask_drop;
+                                bm = std::max(bm, c);
+                            }
+                            near = bm >= thr && bm >= 0;
+                        }
+#if defined(__SSE2__)
+near_cells:
+#endif
+                        if (near) {
+                            for (int64_t j = j0; j < j1; ++j) {
+                                if (cpos[j] >= thr && cpos[j] >= 0) {
+                                    idxs.push_back((uint32_t) j);
+                                    if constexpr (causal && is_2d) {
+                                        if (cpos[j] == p1 && cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                                            row[j] = mask_drop;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
                 }
             }
 
@@ -1959,6 +2034,7 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
             /*.n_tps            =*/ n_tps,
             /*.rows             =*/ rows,
             /*.block_uniform    =*/ attn_mask.block_uniform,
+            /*.single_seq       =*/ n_seq_max == 1,
         };
 
         if (dst->type == GGML_TYPE_F16) {
@@ -1972,6 +2048,8 @@ void llama_kv_cache::set_input_attn_mask(const llm_attn_mask & attn_mask, const 
         //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
     }
 }
+
+#include "llama-kv-cache-p100.inc"
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
@@ -3092,6 +3170,7 @@ llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : sta
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
     n_kv = kv->get_size();
+    reserve = true;
 
     // worst case for graph reservation, only a unified cache splits into per-sequence lists
     n_kv_rows = kv->get_n_stream() == 1 ? n_kv : 0;
@@ -3233,7 +3312,30 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_attn_mask(const llm_attn_mask & attn_mask, const llama_ubatch * ubatch, bool causal_attn) const {
+    ggml_tensor * dst = attn_mask.raw;
+    if (dst && dst->buffer && dst->type == GGML_TYPE_I32) {
+        // compact causal mask (build_attn_inp_kq_mask): only built without kv rows
+        GGML_ASSERT(attn_mask.rows == nullptr);
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        GGML_ASSERT(dst->ne[0] == (int64_t) ubatch->n_tokens);
+        if (!kv->kq_mask_prefix(ubatch, n_kv, causal_attn, (int32_t *) dst->data)) {
+            GGML_ABORT("compact KQ mask chosen at graph build no longer holds");
+        }
+        return;
+    }
     kv->set_input_attn_mask(attn_mask, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::kq_mask_compact(const llama_ubatch & ubatch, bool causal_attn) const {
+    // decode and MTP verify (a few tokens) keep the full mask: their mask is small, and their kernels
+    // would need it expanded on the GPU
+    if (ubatch.n_tokens < 32) {
+        return false;
+    }
+    if (reserve) {
+        return kv->kq_mask_compact_static() && causal_attn;
+    }
+    return kv->kq_mask_prefix(&ubatch, n_kv, causal_attn, nullptr);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

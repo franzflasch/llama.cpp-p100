@@ -1427,6 +1427,7 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool grows = value && (!cparams.embeddings_nextn || (cparams.embeddings_nextn_masked && !masked));
     if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
         // these flags change the graph shape
         sched_need_reserve = true;
@@ -1439,6 +1440,12 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
     if (cparams.embeddings_nextn_dev && (!value || masked)) {
         cparams.embeddings_nextn_dev = false;
         h_nextn_dev_alloc();
+    }
+
+    // grow the (pinned) output buffer now, at setup, rather than inside the first decode: unmasked nextn
+    // rows take n_batch*n_embd floats (~640 MiB at -b 32768), ~0.3 s to pin and clear
+    if (grows && buf_output) {
+        output_reserve(n_seq_max());
     }
 }
 
@@ -1880,7 +1887,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // fixed-width verify: declare the real tokens to the backends for this enqueue only
+    static const auto set_active = [] {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        return reg ? (void (*)(int, int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_active_tokens") : nullptr;
+    }();
+    const bool active = set_active && cparams.n_active_tokens > 0 && ubatch.n_tokens >= 2 && ubatch.n_tokens <= 8 &&
+        cparams.n_active_tokens < (int32_t) ubatch.n_tokens;
+    if (active) {
+        set_active(cparams.n_active_tokens, (int) ubatch.n_tokens);
+    }
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (active) {
+        set_active(0, 0);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2428,7 +2448,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                if (t_logits->ne[0] == n_vocab) {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                } else {
+                    // a head over the first ne0 tokens only (MTP draft vocab): the rest get -inf
+                    const int64_t nd = t_logits->ne[0];
+                    GGML_ASSERT(nd < n_vocab && ggml_nelements(t_logits) >= nd*n_outputs);
+                    if (n_outputs == 1) {
+                        ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, nd*sizeof(float));
+                        std::fill(logits_out + nd, logits_out + n_vocab, -INFINITY);
+                    } else {
+                        std::vector<float> tmp(nd*n_outputs);
+                        ggml_backend_sched_synchronize(sched.get()); // the plain get does not wait for the compute streams
+                        ggml_backend_tensor_get(t_logits, tmp.data(), 0, tmp.size()*sizeof(float));
+                        for (int64_t r = 0; r < n_outputs; ++r) {
+                            std::copy(tmp.begin() + r*nd, tmp.begin() + (r + 1)*nd, logits_out + r*n_vocab);
+                            std::fill(logits_out + r*n_vocab + nd, logits_out + (r + 1)*n_vocab, -INFINITY);
+                        }
+                    }
+                }
             }
         }
 
@@ -2625,7 +2663,10 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
-    const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
+    // reserve at least 64 output rows up front: the buffer is pinned host memory that also holds the
+    // n_batch-sized nextn embeddings (~700 MB at -b 32768), and every growth (prompt -> speculative
+    // verification with n_draft+1 outputs) re-pins and clears all of it (~0.3 s each)
+    const int64_t n_outputs_max = std::max<int64_t>({(int64_t) n_outputs, (int64_t) n_seq_max(), std::min<int64_t>(64, cparams.n_outputs_max)});
 
     const auto n_batch    = cparams.n_batch;
     const auto n_vocab    = vocab.n_tokens();
@@ -4712,6 +4753,10 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+void llama_set_n_active_tokens(llama_context * ctx, int32_t n) {
+    ctx->set_n_active_tokens(n);
 }
 
 void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {

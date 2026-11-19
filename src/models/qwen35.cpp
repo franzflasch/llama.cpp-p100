@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h" // MTP catch-up: store K/V without attending
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -418,15 +419,14 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
-    cb(state, "state_predelta", il);
-
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
     cb(conv_output_silu, "conv_output_silu", il);
+
+    // keep the conv next to the conv state ops (backends can fuse them)
+    ggml_build_forward_expand(gf, conv_output_silu);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
 
@@ -470,6 +470,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(q_conv, "q_conv_predelta", il);
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
+
+    // gate and beta first, next to each other (backends fuse both mat-vecs and their epilogues), then the
+    // q/k norms and the state read right before the delta net (backends can fuse those into it)
+    ggml_build_forward_expand(gf, gate);
+    ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
 
     ggml_tensor * output = build_recurrent_attn(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il);
 
@@ -617,6 +628,32 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     Qcur = build_rope(Qcur, inp_pos, il);
     Kcur = build_rope(Kcur, inp_pos, il);
 
+    // No outputs requested: this is the MTP catch-up over the target's verified tokens, which exists
+    // only to write their K/V into the draft's cache for the draft steps that follow; its outputs
+    // are discarded (the caller carries the target's hidden states, not the draft's). Store K/V and
+    // stop: attention over the whole cache, the output projection and the FFN are never computed,
+    // and the KQ mask is never filled or uploaded. The cache contents are the same, so the drafts
+    // are byte-identical. OPTLOG 207.
+    if (n_outputs == 0) {
+        ggml_tensor * k_st = Kcur;
+        ggml_tensor * v_st = Vcur;
+        if (inp_attn->self_k_rot[il]) {
+            k_st = llama_mul_mat_hadamard(ctx0, k_st, inp_attn->self_k_rot[il]);
+        }
+        if (inp_attn->self_v_rot[il]) {
+            v_st = llama_mul_mat_hadamard(ctx0, v_st, inp_attn->self_v_rot[il]);
+        }
+        ggml_build_forward_expand(gf, v_st);
+        ggml_build_forward_expand(gf, k_st);
+        const auto * mctx_cur = inp_attn->mctx;
+        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_st, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_st, inp_attn->get_v_idxs(), il));
+        GGML_UNUSED(gate);
+        GGML_UNUSED(Qcur);
+        GGML_UNUSED(inp_out_ids);
+        return;
+    }
+
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
@@ -659,7 +696,8 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     cb(cur, "mtp_shared_head_norm", -1);
 
-    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+    ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head
+                         : model.output_draft ? model.output_draft : model.output;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur);
     cb(cur, "result_output", -1);
