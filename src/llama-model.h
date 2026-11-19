@@ -840,6 +840,7 @@ struct llama_model {
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
+    struct ggml_tensor * output_draft    = nullptr; // MTP draft head: the first rows of output
     struct ggml_tensor * output_norm_enc = nullptr;
 
 
