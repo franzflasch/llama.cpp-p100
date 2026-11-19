@@ -5,6 +5,7 @@
 
 #include <list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 // which prompt goes to which slot: slot prompt state, prompt cache and slot selection
@@ -56,9 +57,10 @@ struct server_prompt {
 struct server_prompt_data {
     common_state_data main;
     common_state_data drft;
+    std::vector<uint8_t> spec; // the draft's carry-over (common_speculative_get_state), e.g. the MTP hidden row
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -105,7 +107,9 @@ struct server_prompt_cache {
     bool has_better(const server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new) const;
 
     // restore the result of find_better into the slot `id_slot`
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // spec_out (optional): set to the loaded entry's speculative state when an entry replaced the slot's state
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              std::optional<std::vector<uint8_t>> * spec_out = nullptr);
 
     void update();
 };

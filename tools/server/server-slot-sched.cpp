@@ -158,6 +158,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
         },
     });
 
@@ -218,7 +219,8 @@ bool server_prompt_cache::has_better(const server_prompt & prompt, const server_
     return find_better(prompt, tokens_new, lora_new, lcp) != states.cend();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, const std::vector<common_adapter_lora_info> & lora_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               std::optional<std::vector<uint8_t>> * spec_out) {
     int lcp_best = 0;
 
     const auto it_found = find_better(prompt, tokens_new, lora_new, lcp_best);
@@ -262,6 +264,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         // the whole cached prompt is a prefix of the new one
         if (lcp_best == (int) it_best->prompt.tokens.size()) {
             SRV_DBG("%s", "__TEST_TAG_PROMPT_CACHE_FULL_RESTORE__\n");
+        }
+
+        if (spec_out != nullptr) {
+            *spec_out = std::move(it_best->data.spec);
         }
 
         prompt = std::move(it_best->prompt);

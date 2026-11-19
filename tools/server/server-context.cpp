@@ -17,6 +17,8 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_set_n_active_tokens (fixed-width verify)
+
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -175,6 +177,10 @@ struct server_batch {
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
+    // a padded fixed-width verify of one slot: its real tokens, and the batch size it applies to
+    int32_t n_active      = 0;
+    int32_t n_active_full = 0;
+
     void init(llama_context * ctx, int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
         this->n_embd = n_embd;
@@ -212,6 +218,8 @@ struct server_batch {
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
+        n_active          = 0;
+        n_active_full     = 0;
     }
 
     int32_t size() const {
@@ -267,6 +275,11 @@ struct server_batch {
 struct server_slot {
     int id;
 
+    // n_tokens of the context checkpoint the memory was just restored from, while nothing has been
+    // decoded since (-1 otherwise): creating a checkpoint at that n_tokens would copy the same state
+    // again (~150 MiB for Qwen3.8 under -sm tensor, ~0.2 s), so create_checkpoint keeps the existing one.
+    int64_t ckpt_current = -1;
+
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
@@ -308,7 +321,12 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    // fixed-width verify: the draft is padded to n_max and only its first spec_n_real tokens are
+    // real (-1: not padded)
+    int  spec_n_real = -1;
     std::mt19937 spec_synth_rng;
+    std::mt19937 spec_dist_rng;
+    bool spec_replay_forced = false; // the replayed tokens came from the speculative-sampling rule
 
     // TODO: move members that belong to the task (such as `generated`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -375,6 +393,8 @@ struct server_slot {
             prompt_cache.states.pop_back();
             return false;
         }
+        // the draft's carry-over (MTP: the hidden row the next batch pairs with), as in slot files
+        common_speculative_get_state(spec, id, cur->data.spec);
 
         SLT_TRC(*this, "prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
 
@@ -382,9 +402,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, const std::vector<common_adapter_lora_info> & lora_new) {
-        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id);
+        std::optional<std::vector<uint8_t>> data_spec;
+        bool res = prompt_cache.load(prompt, tokens, lora_new, ctx_tgt, ctx_dft, id, &data_spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (data_spec) {
+            // a cached state replaced the slot's: its carry-over too (empty: none, the next batch pairs with zeros)
+            common_speculative_set_state(spec, id, *data_spec);
         }
 
         return res;
@@ -438,6 +462,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_replay_forced = false;
+        spec_n_real = -1;
 
         last_nl_pos    = 0;
         generated      = {};
@@ -649,6 +675,14 @@ struct server_slot {
 
             GGML_ASSERT(spec_i_batch.empty());
 
+            if (spec_n_real >= 0 && batch.size() == 0) {
+                batch.n_active      = spec_n_real + 1;
+                batch.n_active_full = (int32_t) spec_draft.size() + 1;
+            } else {
+                batch.n_active      = 0;
+                batch.n_active_full = 0;
+            }
+
             spec_i_batch.push_back(batch.size());
             for (size_t i = 0; i < spec_draft.size(); i++) {
                 spec_i_batch.push_back(batch.size() + i + 1);
@@ -669,6 +703,7 @@ struct server_slot {
     }
 
     void release() {
+        ckpt_current = -1;
         if (is_processing()) {
             GGML_ASSERT(task);
 
@@ -1105,6 +1140,8 @@ private:
     llama_context * ctx_dft   = nullptr;
 
     common_speculative_init_result_ptr spec_init;
+    bool spec_pad = false; // verify at a fixed width, padding short drafts
+    bool spec_reads_prompt = true; // a draft type reads the prompt tokens when drafting
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1515,8 +1552,12 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            // fixed-width verify: one slot only, since the real token count is declared per decode
+            spec_pad = params_base.n_parallel == 1;
+            params_base.speculative.draft.pad_verify = spec_pad;
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec_reads_prompt = !spec || common_speculative_draft_reads_prompt(spec.get());
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -1929,6 +1970,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.ckpt_current = -1;
         auto task_loras = get_task_lora(task);
 
         // the state can come from the prompt cache, so it is compared with its own lora config, not with the one of the last task
@@ -2065,6 +2107,11 @@ private:
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
+
+            if (spec) {
+                slot.spec_dist_rng.seed(common_sampler_get_seed(slot.smpl.get()) ^ 0x9e3779b9u);
+                common_speculative_set_seed(spec.get(), common_sampler_get_seed(slot.smpl.get()) ^ 0x5eed5eedu);
+            }
 
             if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
@@ -2726,6 +2773,27 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
+        // the memory still equals the checkpoint it was restored from: keep that one (claimed by this task)
+        {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            const int64_t current = slot.ckpt_current;
+            slot.ckpt_current = -1;
+            if (current == n_tokens_new) {
+                for (auto & ck : slot.prompt.checkpoints) {
+                    if (ck->n_tokens == n_tokens_new) {
+                        // claim it so the min-step eviction above keeps it; the list holds const pointers since
+                        // upstream's ref-counted checkpoints (e152332a1), but every checkpoint is created non-const.
+                        // A slot-file checkpoint (id_task -1) keeps its mark: a failed load of it must fall back.
+                        if (ck->id_task != -1) {
+                            const_cast<common_prompt_checkpoint &>(*ck).id_task = id_task;
+                        }
+                        SLT_TRC(slot, "context checkpoint at n_tokens = %" PRId64 " is current (just restored), kept\n", n_tokens_new);
+                        return;
+                    }
+                }
+            }
+        }
+
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
         {
             const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
@@ -2750,7 +2818,14 @@ private:
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // A draft whose memory truncates at any position (a plain KV cache, e.g. the MTP head) needs no saved
+        // state: a restore ends in slot.mem.seq_rm(pos_next, -1) on both contexts, and the draft's entries
+        // below that position are the ones computed from the same tokens. PARTIAL_ONLY does not apply to a
+        // plain KV cache, so saving it wrote the whole cache (~292 MiB for the MTP head at 262k, ~0.3 s per
+        // checkpoint). The speculative-decoding checkpoints already skip it the same way.
+        if (ctx_dft_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -3272,6 +3347,7 @@ private:
                     try {
                         size_t n_packed = 0;
                         llama_tokens packed;
+                        slot->ckpt_current = -1;
                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
                         if (nread != 0) {
                             packed.resize(std::max<size_t>(1, n_packed));
@@ -3294,6 +3370,7 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3867,7 +3944,11 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // a copy of the whole prompt (260k tokens at full context) that only some draft
+                        // types read; the MTP draft does not
+                        if (spec_reads_prompt) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        }
 
                         const bool spec_reject = slot.use_spec_rejection();
 
@@ -3901,7 +3982,19 @@ private:
             auto & draft = slot.spec_draft;
             auto & ckpt  = slot.spec_ckpt;
 
-            slot.stats.n_draft_tokens += draft.size();
+            // pad a short draft to n_max, so that the verify always has one width and its graph is
+            // reused; the backends compute only the real tokens (llama_set_n_active_tokens)
+            slot.spec_n_real = -1;
+            if (spec_pad) {
+                const int n_max = common_speculative_n_max(spec.get());
+                const int n_real = (int) draft.size();
+                if (n_real < n_max && n_max <= slot.get_n_draft_max()) {
+                    draft.resize(n_max, draft.empty() ? slot.sampled : draft.back());
+                    slot.spec_n_real = n_real;
+                }
+            }
+
+            slot.stats.n_draft_tokens += slot.spec_n_real >= 0 ? slot.spec_n_real : (int) draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -4242,6 +4335,7 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
+                                        slot.ckpt_current = reuse.n_past == cur.n_tokens ? cur.n_tokens : -1;
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
                                     }
                                 }
@@ -4400,6 +4494,7 @@ private:
                             return; // the slot is done, skip it entirely
                         }
 
+                        slot.ckpt_current = -1;
                         metrics_queue_prompt(n_tokens_out);
                         slot.stats.n_prompt_processed += n_tokens_out;
                         slot.stats.update_prompt_last();
@@ -4659,8 +4754,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const bool padded = batch.n_active > 0 && batch.view.size() == batch.n_active_full && off == 0;
         queue_tasks.yield_to_queue([&]() {
+            if (padded) {
+                llama_set_n_active_tokens(ctx_tgt, batch.n_active);
+            }
+            for (auto & slot : slots) {
+                slot.ckpt_current = -1;
+            }
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+            if (padded) {
+                llama_set_n_active_tokens(ctx_tgt, 0);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -4906,16 +5011,39 @@ private:
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-
+                std::vector<llama_token> accepted;
+                // the speculative-sampling rule, when the draft was sampled (LLAMA_SPEC_SAMPLE_TEMP)
+                const auto & dists = common_speculative_get_draft_params(spec.get(), slot.id).dists;
+                const size_t n_real_draft = slot.spec_n_real >= 0 ? (size_t) slot.spec_n_real : n_draft;
+                const bool use_dist = synth_probs.empty() && !slot.spec_is_replay && !dists.empty() && dists.size() >= n_real_draft;
                 // drafters that fill no distribution fall back here
                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
-
-                std::vector<llama_token> accepted;
-                if (!synth_probs.empty()) {
+                if (slot.spec_is_replay && slot.spec_replay_forced) {
+                    // replaying tokens the speculative-sampling rule already chose: keep them and
+                    // sample only the position after them
+                    for (size_t i = 0; i < n_draft; ++i) {
+                        common_sampler_accept(slot.smpl.get(), slot.spec_draft[i], true);
+                        accepted.push_back(slot.spec_draft[i]);
+                    }
+                    const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, spec_i_batch[n_draft]);
+                    common_sampler_accept(slot.smpl.get(), id, true);
+                    accepted.push_back(id);
+                } else if (!synth_probs.empty()) {
                     // synthetic acceptance replaces verification entirely, so it comes first
                     accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (use_dist) {
+                    const llama_tokens         draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + n_real_draft);
+                    const std::vector<int32_t> idxs_real(spec_i_batch.begin(), spec_i_batch.begin() + n_real_draft + 1);
+                    accepted = common_sampler_sample_and_accept_n_dist(slot.smpl.get(), slot.ctx_tgt, std::vector<int>(idxs_real.begin(), idxs_real.end()),
+                            draft_real, dists, slot.spec_dist_rng);
+                } else if (slot.spec_n_real >= 0 && !slot.spec_is_replay) {
+                    // padded verify: only the first spec_n_real drafts (and their outputs) are real
+                    const int nr = slot.spec_n_real;
+                    const llama_tokens         draft_real(slot.spec_draft.begin(), slot.spec_draft.begin() + nr);
+                    const std::vector<int32_t> idxs_real(spec_i_batch.begin(), spec_i_batch.begin() + nr + 1);
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, idxs_real, draft_real);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
@@ -4923,6 +5051,8 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
                 }
+                slot.spec_n_real = -1;
+                slot.spec_replay_forced = false;
 
                 GGML_ASSERT(accepted.size() >= 1);
 
@@ -4942,6 +5072,7 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
+                        slot.spec_replay_forced = use_dist;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
