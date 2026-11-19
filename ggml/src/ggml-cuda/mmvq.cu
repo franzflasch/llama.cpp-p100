@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-p100.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1527,6 +1528,9 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
+#if GGML_CUDA_P100_MMVQ
+    ggml_cuda_p100_mul_mat_vec_q(ctx, src0, src1, ids, dst, fusion);
+#else
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1656,6 +1660,7 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+#endif // GGML_CUDA_P100_MMVQ
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
@@ -1663,6 +1668,10 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
+#if GGML_CUDA_P100_MMVQ
+    ggml_cuda_p100_op_mul_mat_vec_q(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i, row_low, row_high,
+        src1_ncols, src1_padded_row_size, stream);
+#else
 
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
@@ -1687,4 +1696,5 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+#endif // GGML_CUDA_P100_MMVQ
 }

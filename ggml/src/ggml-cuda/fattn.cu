@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-p100.cuh"
 
 #if !defined(GGML_USE_MUSA)
 
@@ -765,6 +766,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
+    // P100: the tile kernel reads a q4_0 cache directly and beats vec there
+    if (ggml_cuda_p100_fattn_tile_q4_0_direct(dst)) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // If there are no tensor cores available, use the generic tile kernel:
     if (can_use_vector_kernel) {
         if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
@@ -784,6 +790,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst) {
     GGML_ASSERT(dst->op == GGML_OP_FLASH_ATTN_EXT);
+    if (size_t size; ggml_cuda_p100_flash_attn_ext_get_alloc_size(device, dst, size)) {
+        return size;
+    }
 
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -799,6 +808,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            need_f16_K = !ggml_cuda_p100_fattn_tile_q4_0_direct(dst);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
@@ -820,6 +832,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    if (ggml_cuda_p100_flash_attn_ext(ctx, dst)) {
+        return;
+    }
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
@@ -836,5 +851,8 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+    if (bool supported; ggml_cuda_p100_flash_attn_ext_supported(device, dst, supported)) {
+        return supported;
+    }
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
