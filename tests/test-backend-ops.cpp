@@ -10711,6 +10711,8 @@ static const ggml_type other_types[] = {
 #pragma optimize("", off)
 #endif
 
+#include "test-backend-ops-p100.inc"
+
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
@@ -13758,6 +13760,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    p100_add_test_cases_eval(test_cases);
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -14422,6 +14426,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+
+    p100_add_test_cases_perf(test_cases);
 
     return test_cases;
 }
