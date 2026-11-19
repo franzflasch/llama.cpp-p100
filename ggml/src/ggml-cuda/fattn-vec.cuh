@@ -1,3 +1,9 @@
+#include "fattn-p100.cuh"
+
+#if GGML_CUDA_P100_FATTN
+#include "fattn-vec-p100.cuh"
+#else
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 
@@ -656,3 +662,5 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_F8_E4M3)
+
+#endif // GGML_CUDA_P100_FATTN

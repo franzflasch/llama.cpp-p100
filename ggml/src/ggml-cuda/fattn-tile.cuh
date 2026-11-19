@@ -1,3 +1,9 @@
+#include "fattn-p100.cuh"
+
+#if GGML_CUDA_P100_FATTN
+#include "fattn-tile-p100.cuh"
+#else
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 
@@ -1288,3 +1294,5 @@ extern DECL_FATTN_TILE_CASE(256, 256, GGML_TYPE_F16, GGML_TYPE_F16);
 extern DECL_FATTN_TILE_CASE(320, 256, GGML_TYPE_F16, GGML_TYPE_F16);
 extern DECL_FATTN_TILE_CASE(512, 512, GGML_TYPE_F16, GGML_TYPE_F16);
 extern DECL_FATTN_TILE_CASE(576, 512, GGML_TYPE_F16, GGML_TYPE_F16);
+
+#endif // GGML_CUDA_P100_FATTN

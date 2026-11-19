@@ -1,3 +1,6 @@
+#include "gated_delta_net-p100.cuh"
+
+#ifndef GGML_CUDA_GDN_P100
 #include "gated_delta_net.cuh"
 #include "gated-delta-net-mma.cuh"
 #include "ggml-cuda/common.cuh"
@@ -537,3 +540,4 @@ void ggml_cuda_op_gated_delta_net_fused_cache(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
     ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache);
 }
+#endif // GGML_CUDA_GDN_P100

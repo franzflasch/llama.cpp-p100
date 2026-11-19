@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "norm-p100.cuh"
 #include "convert.cuh"
 #include <cstdint>
 
@@ -792,6 +793,9 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 }
 
 void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_cuda_p100_rms_norm(ctx, dst)) {
+        return;
+    }
     const ggml_tensor * src0 = dst->src[0];
     cudaStream_t stream = ctx.stream();
 
@@ -842,6 +846,9 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    if (ggml_cuda_p100_rms_norm_fused(ctx, dst, mul_tensor)) {
+        return;
+    }
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
 
@@ -903,6 +910,9 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
                                      ggml_tensor *               dst,
                                      ggml_tensor *               mul_tensor,
                                      ggml_tensor *               add_tensor) {
+    if (ggml_cuda_p100_rms_norm_fused_add(ctx, dst, mul_tensor, add_tensor)) {
+        return;
+    }
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float               eps          = 0.0f;
 
