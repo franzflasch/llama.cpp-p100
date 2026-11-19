@@ -349,6 +349,7 @@ struct common_params_speculative_draft {
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+    bool pad_verify       = false; // the caller verifies at a fixed width, padding short drafts (set by the server)
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
@@ -359,7 +360,7 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch)
+    int32_t n_ubatch = 0; // physical batch size of the draft context (0 - use the target's n_ubatch); -ubd, --spec-draft-n-ubatch
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -1323,19 +1324,30 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
-// leave default-inserted elements uninitialized; callers must fill them before use
+// Allocator for checkpoint state buffers (hundreds of MiB each, written once by a device-to-host copy):
+// no value-initialization, and large blocks on 2 MiB-aligned memory (see common_ckpt_alloc).
+// A fresh std::vector<uint8_t> of 150 MiB spent ~68 ms zero-filling and taking ~38k page faults, about
+// twice the copy itself, on every checkpoint.
+void * common_ckpt_alloc(size_t n);
+void   common_ckpt_free(void * p);
+
 template <typename T>
-struct common_no_init_allocator : std::allocator<T> {
-    template <typename U> struct rebind { using other = common_no_init_allocator<U>; };
-
-    common_no_init_allocator() = default;
-    template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
-
-    template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+struct common_ckpt_allocator {
+    using value_type = T;
+    common_ckpt_allocator() = default;
+    template <typename U> common_ckpt_allocator(const common_ckpt_allocator<U> &) {}
+    T * allocate(size_t n) { return static_cast<T *>(common_ckpt_alloc(n*sizeof(T))); }
+    void deallocate(T * p, size_t) { common_ckpt_free(p); }
+    template <typename U> void construct(U * p) { ::new ((void *) p) U; }   // default-init: no zero fill
+    template <typename U, typename... A> void construct(U * p, A &&... a) { ::new ((void *) p) U(std::forward<A>(a)...); }
+    template <typename U> bool operator==(const common_ckpt_allocator<U> &) const { return true; }
+    template <typename U> bool operator!=(const common_ckpt_allocator<U> &) const { return false; }
 };
 
-// sequence state data, filled by llama_state_seq_get_data_ext()
-using common_state_data = std::vector<uint8_t, common_no_init_allocator<uint8_t>>;
+using common_ckpt_buffer = std::vector<uint8_t, common_ckpt_allocator<uint8_t>>;
+
+// upstream's name for sequence state data (llama_state_seq_get_data_ext); ours also skips the zero fill
+using common_state_data = common_ckpt_buffer;
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;
