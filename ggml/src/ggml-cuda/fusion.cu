@@ -639,6 +639,9 @@ static bool ggml_cuda_topk_moe_group_fusion(const struct ggml_cgraph * cgraph, i
     return true;
 }
 
+#include "p100/gdn-fusion.cuh"
+
+
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
     args.sigmoid         = false;
     args.sqrt_softplus   = false;
@@ -878,6 +881,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 
     return is_ok;
 }
+
+#include "p100/topk-moe-staged.cuh"
 
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
@@ -1166,10 +1171,9 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             add = cgraph->nodes[node_idx+2];
         }
 
-        // the mul operand is a norm weight, which model files store as F32;
-        // the add operand is an F32 bias or a residual with the type of x
+        // the norm kernels are F32 only; the mul operand is a norm weight, which model files store as F32
         const ggml_type type = rms_norm->type;
-        if ((type != GGML_TYPE_F32 && type != GGML_TYPE_BF16) || rms_norm->src[0]->type != type) {
+        if (type != GGML_TYPE_F32 || rms_norm->src[0]->type != type) {
             return false;
         }
 
@@ -1942,8 +1946,14 @@ static int ggml_cuda_try_fuse_inkling2(ggml_backend_cuda_context * cuda_ctx, ggm
     }
 }
 
+#include "p100/try-fuse.cuh"
+
 // try and fuse nodes and return the number of nodes to skip
 int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (const int n_skip = ggml_cuda_p100_try_fuse_pre(cuda_ctx, cgraph, i); n_skip >= 0) {
+        return n_skip;
+    }
+
     if (int n = ggml_cuda_try_fuse_inkling2(cuda_ctx, cgraph, i)) {
         return n;
     }
@@ -2068,8 +2078,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, denom, scale, bias, args);
+                        ggml_cuda_topk_moe_fused_or_staged(*cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, denom, scale, bias, args)) {
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -2083,8 +2092,7 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, denom, scale, bias, args);
+                        ggml_cuda_topk_moe_fused_or_staged(*cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, denom, scale, bias, args)) {
                     return ops.size() - 1;
                 }
             }
@@ -2425,6 +2433,10 @@ int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgrap
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
+    }
+
+    if (const int n_skip = ggml_cuda_p100_try_fuse_post(cuda_ctx, cgraph, i)) {
+        return n_skip;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
